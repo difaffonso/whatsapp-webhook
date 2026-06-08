@@ -58,5 +58,6 @@ app.get('/', (req, res) => {
 // PORTA — Railway injeta PORT automaticamente
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
+  // deploy fix
   console.log(`Servidor rodando na porta ${PORT}`);
 });
