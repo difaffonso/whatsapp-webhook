@@ -12,10 +12,14 @@ app.get('/api/webhook/whatsapp', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
+
+  console.log('Verificação recebida:', { mode, token });
+
   if (mode === 'subscribe' && token === VERIFY_TOKEN) {
     console.log('Webhook verificado!');
     res.status(200).send(challenge);
   } else {
+    console.log('Token inválido:', token);
     res.sendStatus(403);
   }
 });
@@ -24,7 +28,6 @@ app.get('/api/webhook/whatsapp', (req, res) => {
 app.post('/api/webhook/whatsapp', (req, res) => {
   try {
     const body = req.body;
-    console.log('Mensagem recebida:', JSON.stringify(body, null, 2));
 
     if (body.object === 'whatsapp_business_account') {
       const entry = body.entry?.[0];
@@ -47,10 +50,12 @@ app.post('/api/webhook/whatsapp', (req, res) => {
   }
 });
 
+// Health check
 app.get('/', (req, res) => {
   res.send('WhatsApp Webhook ativo!');
 });
 
+// PORTA — Railway injeta PORT automaticamente
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Servidor rodando na porta ${PORT}`);
