@@ -7,28 +7,94 @@ const VERIFY_TOKEN = process.env.WHATSAPP_TOKEN || "affonso2025";
 const ACCESS_TOKEN = process.env.WHATSAPP_ACCESS_TOKEN;
 const PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID;
 
+const WHATSAPP_SECRETARIA = "5511987669852";
+
+// Verifica se está dentro do horário de atendimento
+function dentroDoHorario() {
+  const agora = new Date();
+  const sp = new Date(agora.toLocaleString("en-US", { timeZone: "America/Sao_Paulo" }));
+  const dia = sp.getDay();
+  const hora = sp.getHours();
+  const minuto = sp.getMinutes();
+  const horaDecimal = hora + minuto / 60;
+
+  if (dia >= 1 && dia <= 5) {
+    return horaDecimal >= 8 && horaDecimal < 19.5;
+  } else if (dia === 6) {
+    return horaDecimal >= 8 && horaDecimal < 12;
+  }
+  return false;
+}
+
+// Envia mensagem via WhatsApp API
+async function enviarMensagem(para, texto) {
+  const url = `https://graph.facebook.com/v19.0/${PHONE_NUMBER_ID}/messages`;
+  const body = {
+    messaging_product: "whatsapp",
+    to: para,
+    type: "text",
+    text: { body: texto }
+  };
+
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${ACCESS_TOKEN}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(body)
+    });
+    const data = await response.json();
+    console.log("Mensagem enviada:", JSON.stringify(data));
+  } catch (err) {
+    console.error("Erro ao enviar mensagem:", err);
+  }
+}
+
+function linkWhatsApp(texto) {
+  const textoCodificado = encodeURIComponent(texto);
+  return `https://wa.me/${WHATSAPP_SECRETARIA}?text=${textoCodificado}`;
+}
+
+function horarioAtendimento() {
+  return `🗓 *Horário de atendimento:*\nSegunda a sexta: 8h às 19h30\nSábado: 8h às 12h`;
+}
+
+function menuPrincipal() {
+  return `Olá! Bem-vindo à *Affonso Odontologia* 🦷\n\nComo posso ajudar você hoje?\n\n1️⃣ Marcar avaliação\n2️⃣ Remarcar consulta\n3️⃣ Urgência\n4️⃣ Falar com atendente\n5️⃣ Outros\n\n_Digite o número da opção desejada._`;
+}
+
+function respostaOpcao(opcao) {
+  const horario = horarioAtendimento();
+  const opcoes = {
+    "1": `Para *marcar uma avaliação*, clique no link abaixo e nossa equipe irá te atender! 😊\n\n${horario}\n\n👉 ${linkWhatsApp("Olá! Gostaria de marcar uma avaliação na Affonso Odontologia.")}`,
+    "2": `Para *remarcar sua consulta*, clique no link abaixo e nossa equipe irá te ajudar! 😊\n\n${horario}\n\n👉 ${linkWhatsApp("Olá! Gostaria de remarcar minha consulta na Affonso Odontologia.")}`,
+    "3": `Para *urgências odontológicas*, entre em contato imediatamente com nossa equipe!\n\n${horario}\n\n👉 ${linkWhatsApp("Olá! Estou com uma urgência odontológica e preciso de atendimento.")}`,
+    "4": `Para *falar com nossa atendente*, clique no link abaixo! 😊\n\n${horario}\n\n👉 ${linkWhatsApp("Olá! Gostaria de falar com a equipe da Affonso Odontologia.")}`,
+    "5": `Para *outros assuntos*, clique no link abaixo! 😊\n\n${horario}\n\n👉 ${linkWhatsApp("Olá! Vim pelo WhatsApp da Affonso Odontologia e preciso de ajuda.")}`
+  };
+  return opcoes[opcao] || null;
+}
+
 // Verificação do webhook
 app.get('/api/webhook/whatsapp', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
-
   console.log('Verificação recebida:', { mode, token });
-
   if (mode === 'subscribe' && token === VERIFY_TOKEN) {
     console.log('Webhook verificado!');
     res.status(200).send(challenge);
   } else {
-    console.log('Token inválido:', token);
     res.sendStatus(403);
   }
 });
 
 // Receber mensagens
-app.post('/api/webhook/whatsapp', (req, res) => {
+app.post('/api/webhook/whatsapp', async (req, res) => {
   try {
     const body = req.body;
-
     if (body.object === 'whatsapp_business_account') {
       const entry = body.entry?.[0];
       const changes = entry?.changes?.[0];
@@ -38,11 +104,20 @@ app.post('/api/webhook/whatsapp', (req, res) => {
       if (messages && messages.length > 0) {
         const msg = messages[0];
         const from = msg.from;
-        const text = msg.text?.body || '';
-        console.log(`Mensagem de ${from}: ${text}`);
+        const texto = msg.text?.body?.trim() || '';
+        console.log(`Mensagem de ${from}: ${texto}`);
+
+        if (!dentroDoHorario()) {
+          await enviarMensagem(from,
+            `Olá! 😊 Obrigado por entrar em contato com a *Affonso Odontologia* 🦷\n\nNo momento estamos fora do horário de atendimento.\n\n${horarioAtendimento()}\n\nAssim que retornarmos, entraremos em contato. Ou se preferir, deixe sua mensagem:\n\n👉 ${linkWhatsApp("Olá! Entrei em contato fora do horário pela Affonso Odontologia.")}`
+          );
+        } else if (['1','2','3','4','5'].includes(texto)) {
+          await enviarMensagem(from, respostaOpcao(texto));
+        } else {
+          await enviarMensagem(from, menuPrincipal());
+        }
       }
     }
-
     res.status(200).json({ status: 'ok' });
   } catch (err) {
     console.error('Erro:', err);
@@ -50,14 +125,11 @@ app.post('/api/webhook/whatsapp', (req, res) => {
   }
 });
 
-// Health check
 app.get('/', (req, res) => {
   res.send('WhatsApp Webhook ativo!');
 });
 
-// PORTA — Railway injeta PORT automaticamente
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
-  // deploy fix
   console.log(`Servidor rodando na porta ${PORT}`);
 });
