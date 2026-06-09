@@ -9,7 +9,9 @@ const PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID;
 
 const WHATSAPP_SECRETARIA = "5511987669852";
 
-// Verifica se está dentro do horário de atendimento
+// Controle anti-spam: armazena último envio por número
+const ultimoEnvio = {};
+
 function dentroDoHorario() {
   const agora = new Date();
   const sp = new Date(agora.toLocaleString("en-US", { timeZone: "America/Sao_Paulo" }));
@@ -18,15 +20,11 @@ function dentroDoHorario() {
   const minuto = sp.getMinutes();
   const horaDecimal = hora + minuto / 60;
 
-  if (dia >= 1 && dia <= 5) {
-    return horaDecimal >= 8 && horaDecimal < 19.5;
-  } else if (dia === 6) {
-    return horaDecimal >= 8 && horaDecimal < 12;
-  }
+  if (dia >= 1 && dia <= 5) return horaDecimal >= 8 && horaDecimal < 19.5;
+  if (dia === 6) return horaDecimal >= 8 && horaDecimal < 12;
   return false;
 }
 
-// Envia mensagem via WhatsApp API
 async function enviarMensagem(para, texto) {
   const url = `https://graph.facebook.com/v19.0/${PHONE_NUMBER_ID}/messages`;
   const body = {
@@ -35,7 +33,6 @@ async function enviarMensagem(para, texto) {
     type: "text",
     text: { body: texto }
   };
-
   try {
     const response = await fetch(url, {
       method: "POST",
@@ -53,8 +50,7 @@ async function enviarMensagem(para, texto) {
 }
 
 function linkWhatsApp(texto) {
-  const textoCodificado = encodeURIComponent(texto);
-  return `https://wa.me/${WHATSAPP_SECRETARIA}?text=${textoCodificado}`;
+  return `https://wa.me/${WHATSAPP_SECRETARIA}?text=${encodeURIComponent(texto)}`;
 }
 
 function horarioAtendimento() {
@@ -68,9 +64,9 @@ function menuPrincipal() {
 function respostaOpcao(opcao) {
   const horario = horarioAtendimento();
   const opcoes = {
-    "1": `Para *marcar uma avaliação*, clique no link abaixo e nossa equipe irá te atender! 😊\n\n${horario}\n\n👉 ${linkWhatsApp("Olá! Gostaria de marcar uma avaliação na Affonso Odontologia.")}`,
-    "2": `Para *remarcar sua consulta*, clique no link abaixo e nossa equipe irá te ajudar! 😊\n\n${horario}\n\n👉 ${linkWhatsApp("Olá! Gostaria de remarcar minha consulta na Affonso Odontologia.")}`,
-    "3": `Para *urgências odontológicas*, entre em contato imediatamente com nossa equipe!\n\n${horario}\n\n👉 ${linkWhatsApp("Olá! Estou com uma urgência odontológica e preciso de atendimento.")}`,
+    "1": `Para *marcar uma avaliação*, clique no link abaixo! 😊\n\n${horario}\n\n👉 ${linkWhatsApp("Olá! Gostaria de marcar uma avaliação na Affonso Odontologia.")}`,
+    "2": `Para *remarcar sua consulta*, clique no link abaixo! 😊\n\n${horario}\n\n👉 ${linkWhatsApp("Olá! Gostaria de remarcar minha consulta na Affonso Odontologia.")}`,
+    "3": `Para *urgências odontológicas*, entre em contato com nossa equipe!\n\n${horario}\n\n👉 ${linkWhatsApp("Olá! Estou com uma urgência odontológica e preciso de atendimento.")}`,
     "4": `Para *falar com nossa atendente*, clique no link abaixo! 😊\n\n${horario}\n\n👉 ${linkWhatsApp("Olá! Gostaria de falar com a equipe da Affonso Odontologia.")}`,
     "5": `Para *outros assuntos*, clique no link abaixo! 😊\n\n${horario}\n\n👉 ${linkWhatsApp("Olá! Vim pelo WhatsApp da Affonso Odontologia e preciso de ajuda.")}`
   };
@@ -82,7 +78,6 @@ app.get('/api/webhook/whatsapp', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
-  console.log('Verificação recebida:', { mode, token });
   if (mode === 'subscribe' && token === VERIFY_TOKEN) {
     console.log('Webhook verificado!');
     res.status(200).send(challenge);
@@ -95,29 +90,60 @@ app.get('/api/webhook/whatsapp', (req, res) => {
 app.post('/api/webhook/whatsapp', async (req, res) => {
   try {
     const body = req.body;
+
     if (body.object === 'whatsapp_business_account') {
       const entry = body.entry?.[0];
       const changes = entry?.changes?.[0];
       const value = changes?.value;
+
+      // Ignora notificações de status (entregue, lido, etc.)
+      if (value?.statuses) {
+        console.log('Notificação de status ignorada');
+        return res.status(200).json({ status: 'ok' });
+      }
+
       const messages = value?.messages;
 
       if (messages && messages.length > 0) {
         const msg = messages[0];
         const from = msg.from;
+        const tipo = msg.type;
+
+        // Ignora mensagens que não são texto
+        if (tipo !== 'text') {
+          console.log(`Mensagem do tipo ${tipo} ignorada`);
+          return res.status(200).json({ status: 'ok' });
+        }
+
         const texto = msg.text?.body?.trim() || '';
         console.log(`Mensagem de ${from}: ${texto}`);
 
+        // Anti-spam: só responde 1 vez a cada 3 minutos por número
+        // Exceto para opções do menu (1-5)
+        const agora = Date.now();
+        const opcaoMenu = ['1','2','3','4','5'].includes(texto);
+        
+        if (!opcaoMenu) {
+          const ultimoTempo = ultimoEnvio[from] || 0;
+          if (agora - ultimoTempo < 3 * 60 * 1000) {
+            console.log(`Anti-spam: ignorando mensagem de ${from}`);
+            return res.status(200).json({ status: 'ok' });
+          }
+          ultimoEnvio[from] = agora;
+        }
+
         if (!dentroDoHorario()) {
           await enviarMensagem(from,
-            `Olá! 😊 Obrigado por entrar em contato com a *Affonso Odontologia* 🦷\n\nNo momento estamos fora do horário de atendimento.\n\n${horarioAtendimento()}\n\nAssim que retornarmos, entraremos em contato. Ou se preferir, deixe sua mensagem:\n\n👉 ${linkWhatsApp("Olá! Entrei em contato fora do horário pela Affonso Odontologia.")}`
+            `Olá! 😊 Obrigado por entrar em contato com a *Affonso Odontologia* 🦷\n\nNo momento estamos fora do horário de atendimento.\n\n${horarioAtendimento()}\n\nAssim que retornarmos, entraremos em contato. Ou se preferir:\n\n👉 ${linkWhatsApp("Olá! Entrei em contato fora do horário pela Affonso Odontologia.")}`
           );
-        } else if (['1','2','3','4','5'].includes(texto)) {
+        } else if (opcaoMenu) {
           await enviarMensagem(from, respostaOpcao(texto));
         } else {
           await enviarMensagem(from, menuPrincipal());
         }
       }
     }
+
     res.status(200).json({ status: 'ok' });
   } catch (err) {
     console.error('Erro:', err);
