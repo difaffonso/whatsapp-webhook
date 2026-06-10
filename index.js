@@ -82,45 +82,54 @@ function setCors(res) {
 async function enviarTemplate(to, template, params) {
   const idiomas = ['pt_BR', 'pt_PT', 'en_US', 'en'];
   const url = `https://graph.facebook.com/v19.0/${PHONE_NUMBER_ID}/messages`;
+  const base = Array.isArray(params) ? params : [];
+  // variações de quantidade de parâmetros (caso o template tenha menos campos)
+  const variantes = [base];
+  if (base.length >= 3) variantes.push([base[0], base[base.length - 1]]);
+  if (base.length >= 2) variantes.push([base[0]]);
   let ultimoErro = null;
   for (const lang of idiomas) {
-    const payload = {
-      messaging_product: 'whatsapp',
-      to: to,
-      type: 'template',
-      template: {
-        name: template,
-        language: { code: lang }
+    let proximoIdioma = false;
+    for (const ps of variantes) {
+      const payload = {
+        messaging_product: 'whatsapp',
+        to: to,
+        type: 'template',
+        template: {
+          name: template,
+          language: { code: lang }
+        }
+      };
+      if (ps.length > 0) {
+        payload.template.components = [{
+          type: 'body',
+          parameters: ps.map(p => ({ type: 'text', text: String(p) }))
+        }];
       }
-    };
-    if (Array.isArray(params) && params.length > 0) {
-      payload.template.components = [{
-        type: 'body',
-        parameters: params.map(p => ({ type: 'text', text: String(p) }))
-      }];
-    }
-    try {
-      const r = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${ACCESS_TOKEN}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(payload)
-      });
-      const data = await r.json();
-      if (!data.error) {
-        console.log('Template OK:', template, lang, to);
-        return { ok: true, lang: lang, id: data.messages && data.messages[0] && data.messages[0].id };
+      try {
+        const r = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${ACCESS_TOKEN}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify(payload)
+        });
+        const data = await r.json();
+        if (!data.error) {
+          console.log('Template OK:', template, lang, 'params:' + ps.length, to);
+          return { ok: true, lang: lang, id: data.messages && data.messages[0] && data.messages[0].id };
+        }
+        ultimoErro = data.error;
+        console.log('Template falhou:', template, lang, 'params:' + ps.length, data.error.code, data.error.message);
+        if (data.error.code === 132001) { proximoIdioma = true; break; }
+        if (data.error.code === 132000) continue; // qtde de parâmetros errada -> tenta próxima variação
+        return { ok: false, error: data.error.message || 'erro Meta' };
+      } catch (err) {
+        return { ok: false, error: 'erro de conexão com a Meta' };
       }
-      ultimoErro = data.error;
-      console.log('Template falhou:', template, lang, data.error.code, data.error.message);
-      // 132001 = template não existe nesse idioma -> tenta o próximo idioma
-      if (data.error.code !== 132001) break;
-    } catch (err) {
-      ultimoErro = { message: 'erro de conexão com a Meta' };
-      break;
     }
+    if (!proximoIdioma) break;
   }
   return { ok: false, error: ultimoErro ? (ultimoErro.message || 'erro Meta') : 'erro desconhecido' };
 }
