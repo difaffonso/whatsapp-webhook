@@ -207,8 +207,8 @@ function getParams(template, nome, data, hora, proc) {
       // nome, médico
       return [nome, MEDICO];
     case 'orcamento_pendente':
-      // nome
-      return [nome];
+      // nome, médico
+      return [nome, MEDICO];
     default:
       return [nome];
   }
