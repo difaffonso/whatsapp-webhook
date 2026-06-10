@@ -70,12 +70,59 @@ function respostaOpcao(opcao) {
 }
 
 // ============================================================
-// NOVO: endpoint de disparo de templates (usado pelo sistema)
+// Disparo de templates (usado pelo sistema da clínica)
+// Tenta vários idiomas: pt_BR -> pt_PT -> en_US -> en
 // ============================================================
 function setCors(res) {
   res.set("Access-Control-Allow-Origin", "*");
   res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.set("Access-Control-Allow-Headers", "Content-Type, x-api-key");
+}
+
+async function enviarTemplate(to, template, params) {
+  const idiomas = ['pt_BR', 'pt_PT', 'en_US', 'en'];
+  const url = `https://graph.facebook.com/v19.0/${PHONE_NUMBER_ID}/messages`;
+  let ultimoErro = null;
+  for (const lang of idiomas) {
+    const payload = {
+      messaging_product: 'whatsapp',
+      to: to,
+      type: 'template',
+      template: {
+        name: template,
+        language: { code: lang }
+      }
+    };
+    if (Array.isArray(params) && params.length > 0) {
+      payload.template.components = [{
+        type: 'body',
+        parameters: params.map(p => ({ type: 'text', text: String(p) }))
+      }];
+    }
+    try {
+      const r = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${ACCESS_TOKEN}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(payload)
+      });
+      const data = await r.json();
+      if (!data.error) {
+        console.log('Template OK:', template, lang, to);
+        return { ok: true, lang: lang, id: data.messages && data.messages[0] && data.messages[0].id };
+      }
+      ultimoErro = data.error;
+      console.log('Template falhou:', template, lang, data.error.code, data.error.message);
+      // 132001 = template não existe nesse idioma -> tenta o próximo idioma
+      if (data.error.code !== 132001) break;
+    } catch (err) {
+      ultimoErro = { message: 'erro de conexão com a Meta' };
+      break;
+    }
+  }
+  return { ok: false, error: ultimoErro ? (ultimoErro.message || 'erro Meta') : 'erro desconhecido' };
 }
 
 app.options('/api/disparar', (req, res) => {
@@ -97,37 +144,11 @@ app.post('/api/disparar', async (req, res) => {
     let to = String(telefone).replace(/\D/g, '');
     if (to.length === 11 || to.length === 10) to = '55' + to;
 
-    const payload = {
-      messaging_product: 'whatsapp',
-      to: to,
-      type: 'template',
-      template: {
-        name: template,
-        language: { code: 'pt_BR' }
-      }
-    };
-    if (Array.isArray(params) && params.length > 0) {
-      payload.template.components = [{
-        type: 'body',
-        parameters: params.map(p => ({ type: 'text', text: String(p) }))
-      }];
+    const resultado = await enviarTemplate(to, template, params);
+    if (!resultado.ok) {
+      return res.status(500).json({ ok: false, error: resultado.error });
     }
-
-    const url = `https://graph.facebook.com/v19.0/${PHONE_NUMBER_ID}/messages`;
-    const r = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${ACCESS_TOKEN}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(payload)
-    });
-    const data = await r.json();
-    console.log('Disparo template:', template, to, JSON.stringify(data));
-    if (data.error) {
-      return res.status(500).json({ ok: false, error: data.error.message || 'erro Meta' });
-    }
-    return res.json({ ok: true, id: data.messages && data.messages[0] && data.messages[0].id });
+    return res.json({ ok: true, id: resultado.id, lang: resultado.lang });
   } catch (err) {
     console.error('Erro /api/disparar:', err);
     return res.status(500).json({ ok: false, error: 'erro interno' });
