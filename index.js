@@ -7,6 +7,7 @@ const VERIFY_TOKEN = process.env.WHATSAPP_TOKEN || "affonso2025";
 const ACCESS_TOKEN = process.env.WHATSAPP_ACCESS_TOKEN;
 const PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID;
 const WHATSAPP_SECRETARIA = "5511987669852";
+const DISPARO_KEY = process.env.DISPARO_KEY || VERIFY_TOKEN;
 
 // Anti-spam em memória
 const ultimoEnvio = {};
@@ -68,6 +69,71 @@ function respostaOpcao(opcao) {
   return opcoes[opcao] || null;
 }
 
+// ============================================================
+// NOVO: endpoint de disparo de templates (usado pelo sistema)
+// ============================================================
+function setCors(res) {
+  res.set("Access-Control-Allow-Origin", "*");
+  res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.set("Access-Control-Allow-Headers", "Content-Type, x-api-key");
+}
+
+app.options('/api/disparar', (req, res) => {
+  setCors(res);
+  res.sendStatus(200);
+});
+
+app.post('/api/disparar', async (req, res) => {
+  setCors(res);
+  try {
+    const key = req.headers['x-api-key'] || (req.body && req.body.key);
+    if (key !== DISPARO_KEY) {
+      return res.status(401).json({ ok: false, error: 'não autorizado' });
+    }
+    const { template, telefone, params } = req.body || {};
+    if (!template || !telefone) {
+      return res.status(400).json({ ok: false, error: 'template e telefone são obrigatórios' });
+    }
+    let to = String(telefone).replace(/\D/g, '');
+    if (to.length === 11 || to.length === 10) to = '55' + to;
+
+    const payload = {
+      messaging_product: 'whatsapp',
+      to: to,
+      type: 'template',
+      template: {
+        name: template,
+        language: { code: 'pt_BR' }
+      }
+    };
+    if (Array.isArray(params) && params.length > 0) {
+      payload.template.components = [{
+        type: 'body',
+        parameters: params.map(p => ({ type: 'text', text: String(p) }))
+      }];
+    }
+
+    const url = `https://graph.facebook.com/v19.0/${PHONE_NUMBER_ID}/messages`;
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${ACCESS_TOKEN}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(payload)
+    });
+    const data = await r.json();
+    console.log('Disparo template:', template, to, JSON.stringify(data));
+    if (data.error) {
+      return res.status(500).json({ ok: false, error: data.error.message || 'erro Meta' });
+    }
+    return res.json({ ok: true, id: data.messages && data.messages[0] && data.messages[0].id });
+  } catch (err) {
+    console.error('Erro /api/disparar:', err);
+    return res.status(500).json({ ok: false, error: 'erro interno' });
+  }
+});
+
 // Verificação do webhook
 app.get('/api/webhook/whatsapp', (req, res) => {
   const mode = req.query['hub.mode'];
@@ -85,71 +151,39 @@ app.get('/api/webhook/whatsapp', (req, res) => {
 app.post('/api/webhook/whatsapp', async (req, res) => {
   try {
     const body = req.body;
-
     if (body.object === 'whatsapp_business_account') {
       const entry = body.entry?.[0];
       const changes = entry?.changes?.[0];
       const value = changes?.value;
-
-      // Ignora notificações de status
       if (value?.statuses) {
-        console.log('Status ignorado');
         return res.status(200).json({ status: 'ok' });
       }
-
       const messages = value?.messages;
       if (messages && messages.length > 0) {
         const msg = messages[0];
         const from = msg.from;
         const tipo = msg.type;
-
-        // Respostas de botão (quick_reply dos templates) → redireciona para secretaria
         if (tipo === 'button') {
           const textoBtn = msg.button?.text || 'agendar';
-          console.log(`Botão clicado por ${from}: ${textoBtn}`);
           const msgTimestampBtn = parseInt(msg.timestamp) * 1000;
-          if (Date.now() - msgTimestampBtn > 30000) {
-            console.log(`Botão antigo ignorado de ${from}`);
-            return res.status(200).json({ status: 'ok' });
-          }
+          if (Date.now() - msgTimestampBtn > 30000) return res.status(200).json({ status: 'ok' });
           await enviarMensagem(from,
             `Ótimo! 😊 Vou te conectar com nossa equipe agora.\n\n👉 Clique para conversar diretamente:\nhttps://wa.me/${WHATSAPP_SECRETARIA}?text=${encodeURIComponent('Olá! Vim pelo WhatsApp da Affonso Odontologia e gostaria de ' + textoBtn.toLowerCase() + '.')}`
           );
           return res.status(200).json({ status: 'ok' });
         }
-
-        // Ignora mensagens que não são texto
-        if (tipo !== 'text') {
-          console.log(`Tipo ${tipo} ignorado`);
-          return res.status(200).json({ status: 'ok' });
-        }
-
-        // ✅ SOLUÇÃO PRINCIPAL: ignora mensagens com mais de 30 segundos
-        // Isso evita reenvios quando o servidor reinicia
+        if (tipo !== 'text') return res.status(200).json({ status: 'ok' });
         const msgTimestamp = parseInt(msg.timestamp) * 1000;
         const agora = Date.now();
         const idadeMsg = agora - msgTimestamp;
-        
-        if (idadeMsg > 30000) {
-          console.log(`Mensagem antiga ignorada (${Math.round(idadeMsg/1000)}s atrás) de ${from}`);
-          return res.status(200).json({ status: 'ok' });
-        }
-
+        if (idadeMsg > 30000) return res.status(200).json({ status: 'ok' });
         const texto = msg.text?.body?.trim() || '';
-        console.log(`Mensagem de ${from}: ${texto} (${Math.round(idadeMsg/1000)}s atrás)`);
-
         const opcaoMenu = ['1','2','3','4','5'].includes(texto);
-
-        // Anti-spam adicional: 3 minutos entre menus (para o mesmo número)
         if (!opcaoMenu) {
           const ultimoTempo = ultimoEnvio[from] || 0;
-          if (agora - ultimoTempo < 3 * 60 * 1000) {
-            console.log(`Anti-spam: ignorando ${from}`);
-            return res.status(200).json({ status: 'ok' });
-          }
+          if (agora - ultimoTempo < 3 * 60 * 1000) return res.status(200).json({ status: 'ok' });
           ultimoEnvio[from] = agora;
         }
-
         if (!dentroDoHorario()) {
           await enviarMensagem(from,
             `Olá! 😊 Obrigado por entrar em contato com a *Affonso Odontologia* 🦷\n\nNo momento estamos fora do horário de atendimento.\n\n${horarioAtendimento()}\n\nAssim que retornarmos, entraremos em contato. Ou se preferir:\n\n👉 ${linkWhatsApp("Olá! Entrei em contato fora do horário pela Affonso Odontologia.")}`
@@ -161,7 +195,6 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
         }
       }
     }
-
     res.status(200).json({ status: 'ok' });
   } catch (err) {
     console.error('Erro:', err);
