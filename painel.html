@@ -17,8 +17,8 @@
   .section-title:first-child { margin-top: 0; }
   .field { margin-bottom: 14px; }
   label { font-size: 14px; color: #444; display: block; margin-bottom: 5px; font-weight: 500; }
-  input, select { width: 100%; padding: 10px 12px; border: 1px solid #ddd; border-radius: 8px; font-size: 15px; color: #333; background: white; outline: none; transition: border-color 0.2s; }
-  input:focus, select:focus { border-color: #25D366; }
+  input { width: 100%; padding: 10px 12px; border: 1px solid #ddd; border-radius: 8px; font-size: 15px; color: #333; background: white; outline: none; transition: border-color 0.2s; }
+  input:focus { border-color: #25D366; }
   .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
   .templates { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 20px; }
   .template-opt { border: 1.5px solid #eee; border-radius: 10px; padding: 12px; cursor: pointer; transition: all 0.2s; display: flex; align-items: center; gap: 8px; }
@@ -30,7 +30,7 @@
   .preview { background: #f0faf4; border: 1px solid #c3e6cb; border-radius: 10px; padding: 14px; margin-bottom: 20px; display: none; }
   .preview-title { font-size: 12px; font-weight: 600; color: #25D366; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.5px; }
   .preview-text { font-size: 14px; color: #333; line-height: 1.6; white-space: pre-wrap; }
-  .btn { width: 100%; padding: 14px; background: #25D366; color: white; border: none; border-radius: 10px; font-size: 16px; font-weight: 600; cursor: pointer; transition: background 0.2s; display: flex; align-items: center; justify-content: center; gap: 8px; }
+  .btn { width: 100%; padding: 14px; background: #25D366; color: white; border: none; border-radius: 10px; font-size: 16px; font-weight: 600; cursor: pointer; transition: background 0.2s; }
   .btn:hover { background: #1ebe5d; }
   .btn:disabled { background: #aaa; cursor: not-allowed; }
   .result { margin-top: 16px; padding: 14px; border-radius: 10px; font-size: 14px; text-align: center; display: none; }
@@ -102,9 +102,9 @@
         <div class="icon">📅</div>
         <div><div class="name">Retorno semestral</div><div class="desc">Lembrete retorno</div></div>
       </div>
-      <div class="template-opt" onclick="selectTemplate('reagendamento')" id="t_reagendamento">
-        <div class="icon">🔄</div>
-        <div><div class="name">Reagendamento</div><div class="desc">Nova data</div></div>
+      <div class="template-opt" onclick="selectTemplate('falta_cancelamento')" id="t_falta_cancelamento">
+        <div class="icon">❌</div>
+        <div><div class="name">Falta/Cancelamento</div><div class="desc">Reagendar</div></div>
       </div>
       <div class="template-opt" onclick="selectTemplate('orcamento_pendente')" id="t_orcamento_pendente">
         <div class="icon">💰</div>
@@ -127,6 +127,7 @@
 <script>
 const PHONE_NUMBER_ID = '1110427162151618';
 const ACCESS_TOKEN = 'EAASoAO9Ee4ABRuTHfZBis9R9yb7iDzxKC3ZBMtuiKfLN7X6vOndkADuRZApTCisifRKt0TN2sEO6XfMH27GlUngp42LZB8K72MLzL003aQdFDap5sFTWS7BF93p61XaIR8so82ZBCMX3HYQTbwVZC2tHDGRAnACS8pJlpG6GO9dgMerUWOU5YzRT833ZCjrt9dvaAZDZD';
+const MEDICO = 'Diego Affonso';
 
 let templateSelecionado = null;
 
@@ -151,14 +152,14 @@ function atualizarPreview() {
   const proc = document.getElementById('procedimento').value || '[Procedimento]';
 
   const previews = {
-    confirmacao_consulta: 'Olá, ' + nome + '! 😊\n\nSua consulta na Affonso Odontologia está confirmada!\n\n📅 Data: ' + data + '\n⏰ Horário: ' + hora + '\n🦷 Procedimento: ' + proc + '\n\nQualquer dúvida, estamos à disposição!',
-    lembrete_vespera: 'Olá, ' + nome + '! 🔔\n\nLembrando que amanhã você tem consulta na Affonso Odontologia!\n\n📅 Data: ' + data + '\n⏰ Horário: ' + hora + '\n\nTe esperamos! 🦷',
-    pos__procedimento_: 'Olá, ' + nome + '! ❤️\n\nEsperamos que esteja se recuperando bem após o procedimento de hoje.\n\nSeguindo as orientações do dentista você terá uma recuperação tranquila.\n\nQualquer dúvida, entre em contato conosco!',
-    pos__consulta: 'Olá, ' + nome + '! ⭐\n\nObrigado por nos visitar hoje!\n\nGostaríamos de saber como foi sua experiência na Affonso Odontologia.\n\nSua opinião é muito importante para nós! 😊',
-    aniversario_paciente: 'Olá, ' + nome + '! 🎂\n\nA equipe da Affonso Odontologia deseja a você um feliz aniversário!\n\nQue este dia seja repleto de alegrias e sorrisos! 😁🦷',
-    controle_semestral: 'Olá, ' + nome + '! 📅\n\nJá se passaram 6 meses desde sua última visita à Affonso Odontologia.\n\nQue tal agendar seu retorno para manter sua saúde bucal em dia? 🦷',
-    reagendamento: 'Olá, ' + nome + '! 🔄\n\nGostaríamos de reagendar sua consulta.\n\n📅 Nova data sugerida: ' + data + '\n⏰ Horário: ' + hora + '\n\nConfirme ou entre em contato!',
-    orcamento_pendente: 'Olá, ' + nome + '! 💰\n\nPassando para lembrar que temos um orçamento pendente para o seu tratamento na Affonso Odontologia.\n\nFicamos à disposição para ajudá-lo! 🦷'
+    confirmacao_consulta: 'Olá ' + nome + '! 😊 Sua consulta na Clínica Affonso Odontologia com Dr(a). ' + MEDICO + ' está confirmada para o dia ' + data + ' às ' + hora + '. Qualquer dúvida estamos à disposição! 📞 11 2524-9975',
+    lembrete_vespera: 'Olá ' + nome + '! 😊 Lembramos que amanhã, dia Dr. Affonso às ' + data + ', você tem consulta agendada na Clínica Affonso Odontologia com Dr(a). ' + MEDICO + '. Confirma sua presença? Responda SIM ou NÃO. 📞 11 2524-9975',
+    pos__procedimento_: 'Olá ' + nome + '! 😊 O Dr(a). ' + MEDICO + ' gostaria de saber como você está se sentindo após o ' + proc + ' de ontem. Está tudo bem? Qualquer desconforto não hesite em nos contatar! 🙏',
+    pos__consulta: 'Olá ' + nome + '! 😊 Esperamos que sua consulta com Dr(a). ' + MEDICO + ' tenha sido ótima! Sua opinião é muito importante para nós. Poderia nos deixar uma avaliação? ⭐ Muito obrigado! 🙏',
+    aniversario_paciente: 'Olá ' + nome + '! A Clínica Affonso Odontologia deseja a você um feliz aniversário! Que este novo ano seja repleto de saúde, alegria e muito a sorrir! 🎂🦷',
+    controle_semestral: 'Olá ' + nome + '! 😊 Notamos que já faz 6 meses desde sua última consulta na Clínica Affonso Odontologia. A avaliação semestral é fundamental para manter sua saúde bucal em dia e prevenir problemas antes que eles apareçam! 🦷 Que tal agendar sua consulta de retorno com Dr(a). ' + MEDICO + '? Estamos te esperando! 😊',
+    falta_cancelamento: 'Olá ' + nome + '! 😊 Notamos que você Cancelou sua consulta na Clínica Affonso Odontologia. Sabemos que imprevistos acontecem! Gostaria de reagendar com Dr(a). ' + MEDICO + '? Estamos à disposição para encontrar o melhor horário para você. 😊',
+    orcamento_pendente: 'Olá ' + nome + '! 😊 Notamos que você possui um orçamento em aberto na Clínica Affonso Odontologia. Gostaríamos de ajudá-lo a iniciar seu tratamento. Tem alguma dúvida sobre o orçamento ou formas de pagamento? Estamos à disposição! 😊'
   };
 
   if (templateSelecionado && previews[templateSelecionado]) {
@@ -181,27 +182,50 @@ function limparTelefone(tel) {
   return '55' + tel.replace(/\D/g, '');
 }
 
+// Parâmetros exatos de cada template conforme aprovado no Meta
+function getParams(template, nome, data, hora, proc) {
+  switch(template) {
+    case 'confirmacao_consulta':
+      // nome, médico, data, hora
+      return [nome, MEDICO, data, hora];
+    case 'lembrete_vespera':
+      // nome, data, hora, médico
+      return [nome, data, hora, MEDICO];
+    case 'pos__procedimento_':
+      // nome, médico, procedimento
+      return [nome, MEDICO, proc];
+    case 'pos__consulta':
+      // nome, médico
+      return [nome, MEDICO];
+    case 'aniversario_paciente':
+      // nome
+      return [nome];
+    case 'controle_semestral':
+      // nome, médico
+      return [nome, MEDICO];
+    case 'falta_cancelamento':
+      // nome, médico
+      return [nome, MEDICO];
+    case 'orcamento_pendente':
+      // nome
+      return [nome];
+    default:
+      return [nome];
+  }
+}
+
 async function enviar() {
   const nome = document.getElementById('nome').value;
   const tel = limparTelefone(document.getElementById('telefone').value);
   const data = formatarData(document.getElementById('data').value);
   const hora = document.getElementById('hora').value;
-  const proc = document.getElementById('procedimento').value || 'consulta';
+  const proc = document.getElementById('procedimento').value || 'procedimento';
 
   const btn = document.getElementById('btnEnviar');
   btn.disabled = true;
   btn.textContent = '⏳ Enviando...';
 
-  const params = {
-    confirmacao_consulta: [nome, 'Dr. Affonso', data, hora, proc],
-    lembrete_vespera: [nome, 'Dr. Affonso', data, hora],
-    pos__procedimento_: [nome, proc],
-    pos__consulta: [nome],
-    aniversario_paciente: [nome],
-    controle_semestral: [nome],
-    reagendamento: [nome, data, hora],
-    orcamento_pendente: [nome, proc]
-  };
+  const params = getParams(templateSelecionado, nome, data, hora, proc);
 
   const body = {
     messaging_product: "whatsapp",
@@ -212,7 +236,7 @@ async function enviar() {
       language: { code: "pt_BR" },
       components: [{
         type: "body",
-        parameters: (params[templateSelecionado] || [nome]).map(p => ({ type: "text", text: p }))
+        parameters: params.map(p => ({ type: "text", text: p }))
       }]
     }
   };
