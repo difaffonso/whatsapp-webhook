@@ -124,14 +124,21 @@ async function enviarTemplate(to, template, params) {
         console.log('Template falhou:', template, lang, 'params:' + ps.length, data.error.code, data.error.message);
         if (data.error.code === 132001) { proximoIdioma = true; break; }
         if (data.error.code === 132000) continue; // qtde de parâmetros errada -> tenta próxima variação
-        return { ok: false, error: data.error.message || 'erro Meta' };
+        return { ok: false, error: fmtErr(data.error) };
       } catch (err) {
         return { ok: false, error: 'erro de conexão com a Meta' };
       }
     }
     if (!proximoIdioma) break;
   }
-  return { ok: false, error: ultimoErro ? (ultimoErro.message || 'erro Meta') : 'erro desconhecido' };
+  return { ok: false, error: ultimoErro ? fmtErr(ultimoErro) : 'erro desconhecido' };
+}
+
+function fmtErr(e) {
+  if (!e) return 'erro desconhecido';
+  let s = '[' + (e.code || '?') + (e.error_subcode ? ('.' + e.error_subcode) : '') + '] ' + (e.message || '');
+  if (e.error_data && e.error_data.details) s += ' - ' + e.error_data.details;
+  return s;
 }
 
 app.options('/api/disparar', (req, res) => {
