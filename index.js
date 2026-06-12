@@ -215,6 +215,22 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
         const idadeMsg = agora - msgTimestamp;
         if (idadeMsg > 30000) return res.status(200).json({ status: 'ok' });
         const texto = msg.text?.body?.trim() || '';
+        // ===== SIM / NAO — resposta ao lembrete de consulta =====
+        const norm = texto.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+        const isSim = norm === 's' || norm === 'sim' || norm.startsWith('sim ') || norm.startsWith('sim,') || norm.startsWith('sim!') || norm.includes('confirmo') || norm.includes('confirmado');
+        const isNao = norm === 'n' || norm === 'nao' || norm.startsWith('nao ') || norm.startsWith('nao,') || norm.startsWith('nao!') || norm.includes('cancelar') || norm.includes('desmarcar') || norm.includes('nao vou poder') || norm.includes('nao posso');
+        if (isSim || isNao) {
+          ultimoEnvio[from] = agora;
+          const nomePerfil = value?.contacts?.[0]?.profile?.name || '';
+          if (isSim) {
+            await enviarMensagem(from, '✅ *Presença confirmada!*\n\nObrigado! Esperamos você. 😊\n\n_Affonso Odontologia_ 🦷');
+            await enviarMensagem(WHATSAPP_SECRETARIA, '✅ *PACIENTE CONFIRMOU*\n\n👤 ' + (nomePerfil || 'Paciente') + '\n📱 ' + from + '\n\nRespondeu *SIM* ao lembrete de consulta.');
+          } else {
+            await enviarMensagem(from, 'Tudo bem! 😊\n\nNossa equipe entrará em contato para *remarcar* seu horário.\n\nSe preferir, ligue: 📞 11 2524-9975\n\n_Affonso Odontologia_ 🦷');
+            await enviarMensagem(WHATSAPP_SECRETARIA, '❌ *PACIENTE DESMARCOU*\n\n👤 ' + (nomePerfil || 'Paciente') + '\n📱 ' + from + '\n\nRespondeu *NÃO* ao lembrete.\n⚠️ Ligar para remarcar!');
+          }
+          return res.status(200).json({ status: 'ok' });
+        }
         const opcaoMenu = ['1','2','3','4','5'].includes(texto);
         if (!opcaoMenu) {
           const ultimoTempo = ultimoEnvio[from] || 0;
