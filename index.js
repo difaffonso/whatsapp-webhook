@@ -9,6 +9,70 @@ const PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID;
 const WHATSAPP_SECRETARIA = "5511987669852";
 const DISPARO_KEY = process.env.DISPARO_KEY || VERIFY_TOKEN;
 
+// ===== Supabase: atualizar status da consulta =====
+const SUPA_URL = "https://ncfsepyzrqaljswjiuiv.supabase.co";
+const SUPA_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5jZnNlcHl6cnFhbGpzd2ppdWl2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg1MTg1NzYsImV4cCI6MjA5NDA5NDU3Nn0.j_7sctB2bP0zljxPbh3Q4I_MzEksgL8PO5QNdzbaJDM";
+
+// normaliza telefone para comparar (so digitos, com/sem 55)
+function soDigitos(s) { return String(s || '').replace(/[^0-9]/g, ''); }
+function mesmoTelefone(a, b) {
+  var da = soDigitos(a), db = soDigitos(b);
+  if (!da || !db) return false;
+  // compara os ultimos 8 digitos (ignora DDI/DDD divergentes)
+  return da.slice(-8) === db.slice(-8);
+}
+
+// Atualiza status da consulta de amanha (ou a mais proxima futura) do paciente
+async function atualizarStatusConsulta(telefone, novoStatus) {
+  try {
+    var r = await fetch(SUPA_URL + "/rest/v1/clinic_data?id=eq.main&select=data", {
+      headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY }
+    });
+    var rows = await r.json();
+    if (!rows || !rows[0] || !rows[0].data) return { ok: false, motivo: 'sem dados' };
+    var data = rows[0].data;
+    var pats = data.pats || [];
+    var appts = data.appts || [];
+
+    // 1) achar paciente pelo telefone
+    var pac = pats.find(function (p) { return mesmoTelefone(p.phone, telefone); });
+    if (!pac) return { ok: false, motivo: 'paciente nao encontrado' };
+
+    // 2) datas: amanha e hoje (fuso SP)
+    var sp = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Sao_Paulo" }));
+    var hojeStr = sp.toISOString().split('T')[0];
+    var amanhaD = new Date(sp); amanhaD.setDate(sp.getDate() + 1);
+    var amanhaStr = amanhaD.toISOString().split('T')[0];
+
+    // 3) achar consulta: prioridade amanha; senao a proxima futura nao finalizada
+    var candidatas = appts.filter(function (a) {
+      return a.patientId === pac.id && (a.status === 'pending' || a.status === 'confirmed');
+    });
+    var alvo = candidatas.find(function (a) { return a.date === amanhaStr; })
+      || candidatas.filter(function (a) { return a.date >= hojeStr; }).sort(function (a, b) { return a.date.localeCompare(b.date); })[0];
+    if (!alvo) return { ok: false, motivo: 'consulta nao encontrada', nome: pac.name };
+
+    // 4) aplicar novo status
+    var novoAppts = appts.map(function (a) {
+      return a.id === alvo.id ? Object.assign({}, a, { status: novoStatus }) : a;
+    });
+    var novoData = Object.assign({}, data, { appts: novoAppts });
+
+    // 5) salvar de volta
+    var rs = await fetch(SUPA_URL + "/rest/v1/clinic_data?id=eq.main", {
+      method: "PATCH",
+      headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY, "Content-Type": "application/json", "Prefer": "return=minimal" },
+      body: JSON.stringify({ data: novoData, updated_at: new Date().toISOString() })
+    });
+    if (!rs.ok) return { ok: false, motivo: 'falha ao salvar', nome: pac.name };
+    return { ok: true, nome: pac.name, date: alvo.date, time: alvo.time, proc: alvo.procedure || '' };
+  } catch (e) {
+    console.error('atualizarStatusConsulta erro:', e);
+    return { ok: false, motivo: 'erro: ' + (e && e.message) };
+  }
+}
+
+
 // Anti-spam em memória
 const ultimoEnvio = {};
 
@@ -248,10 +312,28 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
           const nomePerfil = value?.contacts?.[0]?.profile?.name || '';
           if (isSim) {
             await enviarMensagem(from, '✅ *Presença confirmada!*\n\nObrigado! Esperamos você. 😊\n\n_Affonso Odontologia_ 🦷');
-            await enviarMensagem(WHATSAPP_SECRETARIA, '✅ *PACIENTE CONFIRMOU*\n\n👤 ' + (nomePerfil || 'Paciente') + '\n📱 ' + from + '\n\nRespondeu *SIM* ao lembrete de consulta.');
+            var resSim = await atualizarStatusConsulta(from, 'confirmed');
+            var nomeSim = (resSim && resSim.nome) || nomePerfil || 'Paciente';
+            var avisoSim = '✅ *PACIENTE CONFIRMOU*\n\n👤 ' + nomeSim + '\n📱 ' + from;
+            if (resSim && resSim.ok) {
+              avisoSim += '\n📅 ' + resSim.date + ' às ' + resSim.time + (resSim.proc ? ' — ' + resSim.proc : '');
+              avisoSim += '\n\n✔️ *Status atualizado para CONFIRMADO no sistema.*';
+            } else {
+              avisoSim += '\n\nRespondeu *SIM* ao lembrete.\n⚠️ Não consegui atualizar o sistema automaticamente (' + ((resSim && resSim.motivo) || 'verifique') + '). Confirme manualmente.';
+            }
+            await enviarMensagem(WHATSAPP_SECRETARIA, avisoSim);
           } else {
             await enviarMensagem(from, 'Tudo bem! 😊\n\nNossa equipe entrará em contato para *remarcar* seu horário.\n\nSe preferir, ligue: 📞 11 2524-9975\n\n_Affonso Odontologia_ 🦷');
-            await enviarMensagem(WHATSAPP_SECRETARIA, '❌ *PACIENTE DESMARCOU*\n\n👤 ' + (nomePerfil || 'Paciente') + '\n📱 ' + from + '\n\nRespondeu *NÃO* ao lembrete.\n⚠️ Ligar para remarcar!');
+            var resNao = await atualizarStatusConsulta(from, 'cancelled');
+            var nomeNao = (resNao && resNao.nome) || nomePerfil || 'Paciente';
+            var avisoNao = '❌ *PACIENTE DESMARCOU*\n\n👤 ' + nomeNao + '\n📱 ' + from;
+            if (resNao && resNao.ok) {
+              avisoNao += '\n📅 ' + resNao.date + ' às ' + resNao.time + (resNao.proc ? ' — ' + resNao.proc : '');
+              avisoNao += '\n\n✔️ *Status atualizado para DESMARCADO no sistema.*\n⚠️ Ligar para remarcar!';
+            } else {
+              avisoNao += '\n\nRespondeu *NÃO* ao lembrete.\n⚠️ Não consegui atualizar o sistema (' + ((resNao && resNao.motivo) || 'verifique') + '). Desmarque manualmente e ligue para remarcar!';
+            }
+            await enviarMensagem(WHATSAPP_SECRETARIA, avisoNao);
           }
           return res.status(200).json({ status: 'ok' });
         }
