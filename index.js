@@ -171,6 +171,30 @@ app.post('/api/disparar', async (req, res) => {
   }
 });
 
+app.options('/api/avisar', (req, res) => {
+  setCors(res);
+  res.sendStatus(200);
+});
+
+app.post('/api/avisar', async (req, res) => {
+  setCors(res);
+  try {
+    const key = req.headers['x-api-key'] || (req.body && req.body.key);
+    if (key !== DISPARO_KEY) {
+      return res.status(401).json({ ok: false, error: 'não autorizado' });
+    }
+    const { texto } = req.body || {};
+    if (!texto) {
+      return res.status(400).json({ ok: false, error: 'texto é obrigatório' });
+    }
+    const ok = await enviarMensagem(WHATSAPP_SECRETARIA, String(texto));
+    return res.json({ ok: !!ok });
+  } catch (err) {
+    console.error('Erro /api/avisar:', err);
+    return res.status(500).json({ ok: false, error: 'erro interno' });
+  }
+});
+
 // Verificação do webhook
 app.get('/api/webhook/whatsapp', (req, res) => {
   const mode = req.query['hub.mode'];
