@@ -54,7 +54,20 @@ async function atualizarStatusConsulta(telefone, novoStatus) {
 
     // 4) aplicar novo status
     var novoAppts = appts.map(function (a) {
-      return a.id === alvo.id ? Object.assign({}, a, { status: novoStatus }) : a;
+      if (a.id !== alvo.id) return a;
+      var patch = { status: novoStatus };
+      if (novoStatus === 'cancelled') {
+        patch.canceladoWA = true;
+        patch.canceladoWAts = new Date().toISOString();
+        patch.motivoCancel = 'Cancelou pelo WhatsApp';
+        patch.noRebook = false;
+        patch.waCancelVisto = false;
+      }
+      if (novoStatus === 'confirmed') {
+        patch.confirmadoWA = true;
+        patch.confirmadoWAts = new Date().toISOString();
+      }
+      return Object.assign({}, a, patch);
     });
     var novoData = Object.assign({}, data, { appts: novoAppts });
 
@@ -72,6 +85,45 @@ async function atualizarStatusConsulta(telefone, novoStatus) {
   }
 }
 
+
+// Processa resposta SIM/NAO — vale para texto digitado E para botao do template
+async function processarRespostaConfirmacao(from, textoResp, nomePerfil) {
+  const norm = String(textoResp || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
+  if (!norm) return false;
+  const isSim = norm === '1' || norm === 's' || norm === 'sim' || norm.indexOf('sim') === 0 || norm.indexOf('confirm') >= 0;
+  const isNao = norm === '2' || norm === 'n' || norm === 'nao' || norm.indexOf('nao') === 0 || norm.indexOf('desmarc') >= 0 || norm.indexOf('cancel') >= 0 || norm.indexOf('remarc') >= 0;
+  if (!isSim && !isNao) return false;
+  const novoStatus = isSim ? 'confirmed' : 'cancelled';
+  const res = await atualizarStatusConsulta(from, novoStatus);
+  // Se NAO existe consulta futura para este numero, nao trata como confirmacao
+  // (ex.: paciente novo digitando 1/2 no menu) -> deixa o menu responder
+  if (!res || (!res.ok && (res.motivo === 'consulta nao encontrada' || res.motivo === 'paciente nao encontrado'))) {
+    return false;
+  }
+  const nomeFb = (res && res.nome) || nomePerfil || 'Paciente';
+  if (isSim) {
+    await enviarMensagem(from, '\u2705 *Presenca confirmada!*\n\nObrigado! Esperamos voce. \ud83d\ude0a\n\n_Affonso Odontologia_ \ud83e\uddb7');
+    let avisoSim = '\u2705 *PACIENTE CONFIRMOU*\n\n\ud83d\udc64 ' + nomeFb + '\n\ud83d\udcf1 ' + from;
+    if (res && res.ok) {
+      avisoSim += '\n\ud83d\udcc5 ' + res.date + ' as ' + res.time + (res.proc ? ' \u2014 ' + res.proc : '');
+      avisoSim += '\n\n\u2714\ufe0f *Status atualizado para CONFIRMADO no sistema.*';
+    } else {
+      avisoSim += '\n\nRespondeu *SIM* ao lembrete.\n\u26a0\ufe0f Nao consegui atualizar o sistema automaticamente (' + ((res && res.motivo) || 'verifique') + '). Confirme manualmente.';
+    }
+    await enviarMensagem(WHATSAPP_SECRETARIA, avisoSim);
+  } else {
+    await enviarMensagem(from, 'Tudo bem! \ud83d\ude0a\n\nNossa equipe entrara em contato para *remarcar* seu horario.\n\nSe preferir, ligue: \ud83d\udcde 11 2524-9975\n\n_Affonso Odontologia_ \ud83e\uddb7');
+    let avisoNao = '\u274c *PACIENTE DESMARCOU (pelo WhatsApp)*\n\n\ud83d\udc64 ' + nomeFb + '\n\ud83d\udcf1 ' + from;
+    if (res && res.ok) {
+      avisoNao += '\n\ud83d\udcc5 ' + res.date + ' as ' + res.time + (res.proc ? ' \u2014 ' + res.proc : '');
+      avisoNao += '\n\n\u2714\ufe0f *Desmarcado automaticamente na agenda.*\n\ud83d\udd04 Ja aparece na aba REMARCAR. Ligar para remarcar!';
+    } else {
+      avisoNao += '\n\nRespondeu *NAO* ao lembrete.\n\u26a0\ufe0f Nao consegui atualizar o sistema (' + ((res && res.motivo) || 'verifique') + '). Desmarque manualmente e ligue para remarcar!';
+    }
+    await enviarMensagem(WHATSAPP_SECRETARIA, avisoNao);
+  }
+  return true;
+}
 
 // Anti-spam em memória
 const ultimoEnvio = {};
@@ -289,9 +341,15 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
         const from = msg.from;
         const tipo = msg.type;
         if (tipo === 'button') {
-          const textoBtn = msg.button?.text || 'agendar';
+          const textoBtn = msg.button?.text || msg.button?.payload || 'agendar';
           const msgTimestampBtn = parseInt(msg.timestamp) * 1000;
-          if (Date.now() - msgTimestampBtn > 30000) return res.status(200).json({ status: 'ok' });
+          if (Date.now() - msgTimestampBtn > 120000) return res.status(200).json({ status: 'ok' });
+          const nomePerfilBtn = value?.contacts?.[0]?.profile?.name || '';
+          const tratadoBtn = await processarRespostaConfirmacao(from, textoBtn, nomePerfilBtn);
+          if (tratadoBtn) {
+            ultimoEnvio[from] = Date.now();
+            return res.status(200).json({ status: 'ok' });
+          }
           await enviarMensagem(from,
             `Ótimo! 😊 Vou te conectar com nossa equipe agora.\n\n👉 Clique para conversar diretamente:\nhttps://wa.me/${WHATSAPP_SECRETARIA}?text=${encodeURIComponent('Olá! Vim pelo WhatsApp da Affonso Odontologia e gostaria de ' + textoBtn.toLowerCase() + '.')}`
           );
@@ -301,40 +359,13 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
         const msgTimestamp = parseInt(msg.timestamp) * 1000;
         const agora = Date.now();
         const idadeMsg = agora - msgTimestamp;
-        if (idadeMsg > 30000) return res.status(200).json({ status: 'ok' });
+        if (idadeMsg > 120000) return res.status(200).json({ status: 'ok' });
         const texto = msg.text?.body?.trim() || '';
-        // ===== SIM / NAO — resposta ao lembrete de consulta =====
-        const norm = texto.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-        const isSim = norm === 's' || norm === 'sim' || norm.startsWith('sim ') || norm.startsWith('sim,') || norm.startsWith('sim!') || norm.includes('confirmo') || norm.includes('confirmado');
-        const isNao = norm === 'n' || norm === 'nao' || norm.startsWith('nao ') || norm.startsWith('nao,') || norm.startsWith('nao!') || norm.includes('cancelar') || norm.includes('desmarcar') || norm.includes('nao vou poder') || norm.includes('nao posso');
-        if (isSim || isNao) {
+        // ===== Confirmacao (SIM/NAO/1/2) — resposta digitada ao lembrete =====
+        const nomePerfilTxt = value?.contacts?.[0]?.profile?.name || '';
+        const tratadoTxt = await processarRespostaConfirmacao(from, texto, nomePerfilTxt);
+        if (tratadoTxt) {
           ultimoEnvio[from] = agora;
-          const nomePerfil = value?.contacts?.[0]?.profile?.name || '';
-          if (isSim) {
-            await enviarMensagem(from, '✅ *Presença confirmada!*\n\nObrigado! Esperamos você. 😊\n\n_Affonso Odontologia_ 🦷');
-            var resSim = await atualizarStatusConsulta(from, 'confirmed');
-            var nomeSim = (resSim && resSim.nome) || nomePerfil || 'Paciente';
-            var avisoSim = '✅ *PACIENTE CONFIRMOU*\n\n👤 ' + nomeSim + '\n📱 ' + from;
-            if (resSim && resSim.ok) {
-              avisoSim += '\n📅 ' + resSim.date + ' às ' + resSim.time + (resSim.proc ? ' — ' + resSim.proc : '');
-              avisoSim += '\n\n✔️ *Status atualizado para CONFIRMADO no sistema.*';
-            } else {
-              avisoSim += '\n\nRespondeu *SIM* ao lembrete.\n⚠️ Não consegui atualizar o sistema automaticamente (' + ((resSim && resSim.motivo) || 'verifique') + '). Confirme manualmente.';
-            }
-            await enviarMensagem(WHATSAPP_SECRETARIA, avisoSim);
-          } else {
-            await enviarMensagem(from, 'Tudo bem! 😊\n\nNossa equipe entrará em contato para *remarcar* seu horário.\n\nSe preferir, ligue: 📞 11 2524-9975\n\n_Affonso Odontologia_ 🦷');
-            var resNao = await atualizarStatusConsulta(from, 'cancelled');
-            var nomeNao = (resNao && resNao.nome) || nomePerfil || 'Paciente';
-            var avisoNao = '❌ *PACIENTE DESMARCOU*\n\n👤 ' + nomeNao + '\n📱 ' + from;
-            if (resNao && resNao.ok) {
-              avisoNao += '\n📅 ' + resNao.date + ' às ' + resNao.time + (resNao.proc ? ' — ' + resNao.proc : '');
-              avisoNao += '\n\n✔️ *Status atualizado para DESMARCADO no sistema.*\n⚠️ Ligar para remarcar!';
-            } else {
-              avisoNao += '\n\nRespondeu *NÃO* ao lembrete.\n⚠️ Não consegui atualizar o sistema (' + ((resNao && resNao.motivo) || 'verifique') + '). Desmarque manualmente e ligue para remarcar!';
-            }
-            await enviarMensagem(WHATSAPP_SECRETARIA, avisoNao);
-          }
           return res.status(200).json({ status: 'ok' });
         }
         const opcaoMenu = ['1','2','3','4','5'].includes(texto);
