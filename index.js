@@ -22,21 +22,46 @@ function mesmoTelefone(a, b) {
   return da.slice(-8) === db.slice(-8);
 }
 
+// Busca o paciente na TABELA patients (separada do clinic_data) pelo telefone
+async function buscarPacientePorTelefone(telefone) {
+  try {
+    var lastId = 0, step = 1000;
+    for (var guard = 0; guard < 500; guard++) {
+      var r = await fetch(SUPA_URL + "/rest/v1/patients?select=id,data&order=id.asc&limit=" + step + "&id=gt." + lastId, {
+        headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY }
+      });
+      if (!r.ok) return null;
+      var rows = await r.json();
+      if (!rows || !rows.length) break;
+      for (var k = 0; k < rows.length; k++) {
+        var pd = rows[k].data;
+        if (pd && mesmoTelefone(pd.phone, telefone)) return pd;
+      }
+      lastId = rows[rows.length - 1].id;
+      if (rows.length < step) break;
+    }
+    return null;
+  } catch (e) {
+    console.error('buscarPacientePorTelefone erro:', e);
+    return null;
+  }
+}
+
 // Atualiza status da consulta de amanha (ou a mais proxima futura) do paciente
 async function atualizarStatusConsulta(telefone, novoStatus) {
   try {
+    // 1) achar paciente pelo telefone (tabela patients, separada do clinic_data)
+    var pac = await buscarPacientePorTelefone(telefone);
+    if (!pac) return { ok: false, motivo: 'paciente nao encontrado' };
+
+    // 2) carregar clinic_data (as consultas ficam aqui)
     var r = await fetch(SUPA_URL + "/rest/v1/clinic_data?id=eq.main&select=data", {
       headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY }
     });
     var rows = await r.json();
     if (!rows || !rows[0] || !rows[0].data) return { ok: false, motivo: 'sem dados' };
     var data = rows[0].data;
-    var pats = data.pats || [];
     var appts = data.appts || [];
-
-    // 1) achar paciente pelo telefone
-    var pac = pats.find(function (p) { return mesmoTelefone(p.phone, telefone); });
-    if (!pac) return { ok: false, motivo: 'paciente nao encontrado' };
 
     // 2) datas: amanha e hoje (fuso SP)
     var sp = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Sao_Paulo" }));
