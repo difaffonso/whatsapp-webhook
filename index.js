@@ -175,6 +175,39 @@ function dentroDoHorario() {
   return false;
 }
 
+// ===== Conversas: salvar mensagem na tabela wa_messages (NUNCA quebra o fluxo) =====
+async function salvarMensagem(direction, telefone, texto, extra) {
+  try {
+    var ph = soDigitos(telefone);
+    if (!ph) return;
+    var obj = Object.assign({
+      phone: ph,
+      direction: direction,
+      body: (texto == null ? '' : String(texto)).slice(0, 4000),
+      ts: new Date().toISOString()
+    }, extra || {});
+    await fetch(SUPA_URL + "/rest/v1/wa_messages", {
+      method: "POST",
+      headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY, "Content-Type": "application/json", "Prefer": "return=minimal" },
+      body: JSON.stringify(obj)
+    });
+  } catch (e) { console.error('salvarMensagem erro:', e); }
+}
+// ===== Conversas: atualizar status (entregue/lido) de uma mensagem ja enviada =====
+async function atualizarStatusMensagem(wamid, status) {
+  try {
+    if (!wamid) return;
+    if (status !== 'delivered' && status !== 'read' && status !== 'failed') return;
+    var filtro = "wamid=eq." + encodeURIComponent(wamid);
+    if (status === 'delivered') filtro += "&status=neq.read"; // nao rebaixar de lido para entregue
+    await fetch(SUPA_URL + "/rest/v1/wa_messages?" + filtro, {
+      method: "PATCH",
+      headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY, "Content-Type": "application/json", "Prefer": "return=minimal" },
+      body: JSON.stringify({ status: status })
+    });
+  } catch (e) { console.error('atualizarStatusMensagem erro:', e); }
+}
+
 async function enviarMensagem(para, texto) {
   const url = `https://graph.facebook.com/v19.0/${PHONE_NUMBER_ID}/messages`;
   try {
@@ -193,6 +226,10 @@ async function enviarMensagem(para, texto) {
     });
     const data = await response.json();
     console.log("Enviado:", JSON.stringify(data));
+    if (soDigitos(para) !== soDigitos(WHATSAPP_SECRETARIA)) {
+      var _wamid = data && data.messages && data.messages[0] && data.messages[0].id;
+      salvarMensagem('out', para, texto, _wamid ? { status: 'sent', wamid: _wamid } : { status: 'sent' });
+    }
   } catch (err) {
     console.error("Erro ao enviar:", err);
   }
@@ -271,7 +308,10 @@ async function enviarTemplate(to, template, params) {
         const data = await r.json();
         if (!data.error) {
           console.log('Template OK:', template, lang, 'params:' + ps.length, to);
-          return { ok: true, lang: lang, id: data.messages && data.messages[0] && data.messages[0].id };
+          var _wamidT = data.messages && data.messages[0] && data.messages[0].id;
+          var _corpo = "\ud83d\udcf2 Lembrete de confirmacao" + (base && base.length ? (": " + base.join(" \u00b7 ")) : "");
+          salvarMensagem('out', to, _corpo, { status: 'sent', wamid: _wamidT, patient_name: (base && base[0]) ? String(base[0]) : null });
+          return { ok: true, lang: lang, id: _wamidT };
         }
         ultimoErro = data.error;
         console.log('Template falhou:', template, lang, 'params:' + ps.length, data.error.code, data.error.message);
@@ -370,6 +410,12 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
       const changes = entry?.changes?.[0];
       const value = changes?.value;
       if (value?.statuses) {
+        try {
+          for (var si = 0; si < value.statuses.length; si++) {
+            var st = value.statuses[si];
+            if (st && st.id && st.status) atualizarStatusMensagem(st.id, st.status);
+          }
+        } catch (e) { console.error('status webhook erro:', e); }
         return res.status(200).json({ status: 'ok' });
       }
       const messages = value?.messages;
@@ -377,6 +423,14 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
         const msg = messages[0];
         const from = msg.from;
         const tipo = msg.type;
+        // Conversas: salvar TODA mensagem recebida (a prova de falha; nao depende dos filtros de acao)
+        var _txtIn = '';
+        if (tipo === 'text') _txtIn = (msg.text && msg.text.body) || '';
+        else if (tipo === 'button') _txtIn = (msg.button && (msg.button.text || msg.button.payload)) || '';
+        else if (tipo === 'interactive') _txtIn = (msg.interactive && ((msg.interactive.button_reply && msg.interactive.button_reply.title) || (msg.interactive.list_reply && msg.interactive.list_reply.title))) || '';
+        else _txtIn = '[' + tipo + ']';
+        var _nomeIn = (value && value.contacts && value.contacts[0] && value.contacts[0].profile && value.contacts[0].profile.name) || null;
+        salvarMensagem('in', from, _txtIn, { status: 'received', wamid: msg.id || null, patient_name: _nomeIn });
         if (tipo === 'button') {
           const textoBtn = msg.button?.text || msg.button?.payload || 'agendar';
           const msgTimestampBtn = parseInt(msg.timestamp) * 1000;
