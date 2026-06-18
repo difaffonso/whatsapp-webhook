@@ -22,25 +22,34 @@ function mesmoTelefone(a, b) {
   return da.slice(-8) === db.slice(-8);
 }
 
-// Busca o paciente na TABELA patients (separada do clinic_data) pelo telefone
+// Busca paciente(s) na TABELA patients (separada do clinic_data) pelo telefone.
+// Retorna { nome, ids:[...] } ou null. Coleta TODOS os ids possiveis (id do registro E id interno,
+// sempre como numero) para casar com appts mesmo havendo cadastro duplicado ou tipo diferente (string x numero).
 async function buscarPacientePorTelefone(telefone) {
   try {
+    var achados = [], nome = '';
     var lastId = 0, step = 1000;
     for (var guard = 0; guard < 500; guard++) {
       var r = await fetch(SUPA_URL + "/rest/v1/patients?select=id,data&order=id.asc&limit=" + step + "&id=gt." + lastId, {
         headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY }
       });
-      if (!r.ok) return null;
+      if (!r.ok) break;
       var rows = await r.json();
       if (!rows || !rows.length) break;
       for (var k = 0; k < rows.length; k++) {
         var pd = rows[k].data;
-        if (pd && mesmoTelefone(pd.phone, telefone)) return pd;
+        if (pd && mesmoTelefone(pd.phone, telefone)) {
+          if (rows[k].id != null) achados.push(Number(rows[k].id));
+          if (pd.id != null) achados.push(Number(pd.id));
+          if (!nome) nome = pd.name || '';
+        }
       }
       lastId = rows[rows.length - 1].id;
       if (rows.length < step) break;
     }
-    return null;
+    if (!achados.length) return null;
+    var ids = achados.filter(function (v, i, a) { return !isNaN(v) && a.indexOf(v) === i; });
+    return { nome: nome, ids: ids };
   } catch (e) {
     console.error('buscarPacientePorTelefone erro:', e);
     return null;
@@ -52,7 +61,9 @@ async function atualizarStatusConsulta(telefone, novoStatus) {
   try {
     // 1) achar paciente pelo telefone (tabela patients, separada do clinic_data)
     var pac = await buscarPacientePorTelefone(telefone);
-    if (!pac) return { ok: false, motivo: 'paciente nao encontrado' };
+    if (!pac || !pac.ids || !pac.ids.length) return { ok: false, motivo: 'paciente nao encontrado' };
+    var idSet = {};
+    pac.ids.forEach(function (i) { idSet[Number(i)] = true; });
 
     // 2) carregar clinic_data (as consultas ficam aqui)
     var r = await fetch(SUPA_URL + "/rest/v1/clinic_data?id=eq.main&select=data", {
@@ -69,13 +80,14 @@ async function atualizarStatusConsulta(telefone, novoStatus) {
     var amanhaD = new Date(sp); amanhaD.setDate(sp.getDate() + 1);
     var amanhaStr = amanhaD.toISOString().split('T')[0];
 
-    // 3) achar consulta: prioridade amanha; senao a proxima futura nao finalizada
+    // 3) achar consulta: prioridade amanha; senao a proxima futura nao finalizada.
+    //    Compara patientId com Number() nos dois lados (evita falha string x numero) e aceita qualquer id do paciente.
     var candidatas = appts.filter(function (a) {
-      return a.patientId === pac.id && (a.status === 'pending' || a.status === 'confirmed');
+      return idSet[Number(a.patientId)] && (a.status === 'pending' || a.status === 'confirmed');
     });
     var alvo = candidatas.find(function (a) { return a.date === amanhaStr; })
       || candidatas.filter(function (a) { return a.date >= hojeStr; }).sort(function (a, b) { return a.date.localeCompare(b.date); })[0];
-    if (!alvo) return { ok: false, motivo: 'consulta nao encontrada', nome: pac.name };
+    if (!alvo) return { ok: false, motivo: 'consulta nao encontrada', nome: pac.nome };
 
     // 4) aplicar novo status
     var novoAppts = appts.map(function (a) {
@@ -102,8 +114,8 @@ async function atualizarStatusConsulta(telefone, novoStatus) {
       headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY, "Content-Type": "application/json", "Prefer": "return=minimal" },
       body: JSON.stringify({ data: novoData, updated_at: new Date().toISOString() })
     });
-    if (!rs.ok) return { ok: false, motivo: 'falha ao salvar', nome: pac.name };
-    return { ok: true, nome: pac.name, date: alvo.date, time: alvo.time, proc: alvo.procedure || '' };
+    if (!rs.ok) return { ok: false, motivo: 'falha ao salvar', nome: pac.nome };
+    return { ok: true, nome: pac.nome, date: alvo.date, time: alvo.time, proc: alvo.procedure || '' };
   } catch (e) {
     console.error('atualizarStatusConsulta erro:', e);
     return { ok: false, motivo: 'erro: ' + (e && e.message) };
