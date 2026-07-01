@@ -139,7 +139,7 @@ async function processarRespostaConfirmacao(from, textoResp, nomePerfil) {
   }
   const nomeFb = (res && res.nome) || nomePerfil || 'Paciente';
   if (isSim) {
-    await enviarMensagem(from, '\u2705 *Presenca confirmada!*\n\nObrigado! Esperamos voce. \ud83d\ude0a\n\n_Affonso Odontologia_ \ud83e\uddb7');
+    await enviarMensagem(from, '\u2705 *Presença confirmada!*\n\nObrigado! Esperamos você. \ud83d\ude0a\n\n_Affonso Odontologia_ \ud83e\uddb7');
     let avisoSim = '\u2705 *PACIENTE CONFIRMOU*\n\n\ud83d\udc64 ' + nomeFb + '\n\ud83d\udcf1 ' + from;
     if (res && res.ok) {
       avisoSim += '\n\ud83d\udcc5 ' + res.date + ' as ' + res.time + (res.proc ? ' \u2014 ' + res.proc : '');
@@ -149,7 +149,7 @@ async function processarRespostaConfirmacao(from, textoResp, nomePerfil) {
     }
     await enviarMensagem(WHATSAPP_SECRETARIA, avisoSim);
   } else {
-    await enviarMensagem(from, 'Tudo bem! \ud83d\ude0a\n\nNossa equipe entrara em contato para *remarcar* seu horario.\n\nSe preferir, ligue: \ud83d\udcde 11 2524-9975\n\n_Affonso Odontologia_ \ud83e\uddb7');
+    await enviarMensagem(from, 'Tudo bem! \ud83d\ude0a\n\nNossa equipe entrará em contato para *remarcar* seu horário.\n\nSe preferir, ligue: \ud83d\udcde 11 2524-9975\n\n_Affonso Odontologia_ \ud83e\uddb7');
     let avisoNao = '\u274c *PACIENTE DESMARCOU (pelo WhatsApp)*\n\n\ud83d\udc64 ' + nomeFb + '\n\ud83d\udcf1 ' + from;
     if (res && res.ok) {
       avisoNao += '\n\ud83d\udcc5 ' + res.date + ' as ' + res.time + (res.proc ? ' \u2014 ' + res.proc : '');
@@ -438,6 +438,24 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
           const nomePerfilBtn = value?.contacts?.[0]?.profile?.name || '';
           const tratadoBtn = await processarRespostaConfirmacao(from, textoBtn, nomePerfilBtn);
           if (tratadoBtn) {
+            ultimoEnvio[from] = Date.now();
+            return res.status(200).json({ status: 'ok' });
+          }
+          // ── Botão Confirmar/Desmarcar sem consulta futura localizada (ex.: telefone divergente no cadastro) ──
+          var normBtn = String(textoBtn || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
+          if (normBtn.indexOf('confirm') >= 0 || normBtn.indexOf('desmarc') >= 0 || normBtn.indexOf('remarc') >= 0 || normBtn.indexOf('cancel') >= 0) {
+            await enviarMensagem(from, 'Recebemos sua resposta! \ud83d\ude0a\n\nPorém não localizamos uma consulta futura vinculada a este número de WhatsApp.\n\nSe acha que houve um engano, fale com nossa equipe:\n\ud83d\udc49 ' + linkWhatsApp('Olá! Respondi ao lembrete de consulta, mas não localizaram meu agendamento.') + '\n\n_Affonso Odontologia_ \ud83e\uddb7');
+            await enviarMensagem(WHATSAPP_SECRETARIA, '\u26a0\ufe0f *RESPOSTA AO LEMBRETE SEM CONSULTA LOCALIZADA*\n\n\ud83d\udc64 ' + (nomePerfilBtn || 'Paciente') + '\n\ud83d\udcf1 ' + from + '\n\ud83d\udd18 Tocou em: ' + textoBtn + '\n\nNão achei consulta futura (Pendente/Confirmada) para este número. Verifique o telefone no cadastro e confirme manualmente com o paciente.');
+            ultimoEnvio[from] = Date.now();
+            return res.status(200).json({ status: 'ok' });
+          }
+          // ── Botões da pesquisa de satisfação (pós-consulta): apenas agradecer ──
+          if (normBtn === 'otimo' || normBtn === 'otima' || normBtn === 'boa' || normBtn === 'bom' || normBtn.indexOf('insatisf') >= 0) {
+            if (normBtn.indexOf('insatisf') >= 0) {
+              await enviarMensagem(from, 'Obrigado pelo seu retorno. \ud83d\ude4f\n\nSentimos muito que a experiência não tenha sido como você esperava. Queremos entender e melhorar — se puder, fale com nossa equipe:\n\ud83d\udc49 ' + linkWhatsApp('Olá! Respondi à pesquisa de satisfação e gostaria de falar sobre meu atendimento.') + '\n\n_Affonso Odontologia_ \ud83e\uddb7');
+            } else {
+              await enviarMensagem(from, 'Muito obrigado pelo seu retorno! \ud83d\udc9a\n\nFicamos felizes em cuidar do seu sorriso. Até a próxima! \ud83d\ude0a\n\n_Affonso Odontologia_ \ud83e\uddb7');
+            }
             ultimoEnvio[from] = Date.now();
             return res.status(200).json({ status: 'ok' });
           }
