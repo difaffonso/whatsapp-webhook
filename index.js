@@ -11,7 +11,7 @@ const DISPARO_KEY = process.env.DISPARO_KEY || VERIFY_TOKEN;
 
 // ===== Supabase: atualizar status da consulta =====
 const SUPA_URL = "https://ncfsepyzrqaljswjiuiv.supabase.co";
-const SUPA_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5jZnNlcHl6cnFhbGpzd2ppdWl2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg1MTg1NzYsImV4cCI6MjA5NDA5NDU3Nn0.j_7sctB2bP0zljxPbh3Q4I_MzEksgL8PO5QNdzbaJDM";
+const SUPA_KEY = process.env.SUPABASE_SERVICE_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5jZnNlcHl6cnFhbGpzd2ppdWl2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg1MTg1NzYsImV4cCI6MjA5NDA5NDU3Nn0.j_7sctB2bP0zljxPbh3Q4I_MzEksgL8PO5QNdzbaJDM"; // service_role via env (ignora RLS); anon como fallback
 
 // normaliza telefone para comparar (so digitos, com/sem 55)
 function soDigitos(s) { return String(s || '').replace(/[^0-9]/g, ''); }
