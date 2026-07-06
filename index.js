@@ -104,6 +104,7 @@ async function atualizarStatusConsulta(telefone, novoStatus) {
     var novoAppts = appts.map(function (a) {
       if (a.id !== alvo.id) return a;
       var patch = { status: novoStatus };
+      patch._ts = Date.now(); // carimbo anti-overwrite: sem isso o app aberto reverte o status no proximo save/merge
       if (novoStatus === 'cancelled') {
         patch.canceladoWA = true;
         patch.canceladoWAts = new Date().toISOString();
