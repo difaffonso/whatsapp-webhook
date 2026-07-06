@@ -22,6 +22,17 @@ function mesmoTelefone(a, b) {
   return da.slice(-8) === db.slice(-8);
 }
 
+// ===== Dedupe: Meta reenvia o webhook se a resposta demorar; processa cada mensagem 1x so =====
+var __msgVistas = {};
+function mensagemJaProcessada(id) {
+  if (!id) return false;
+  var agora = Date.now();
+  for (var k in __msgVistas) { if (agora - __msgVistas[k] > 600000) delete __msgVistas[k]; }
+  if (__msgVistas[id]) return true;
+  __msgVistas[id] = agora;
+  return false;
+}
+
 // Busca paciente(s) na TABELA patients (separada do clinic_data) pelo telefone.
 // Retorna { nome, ids:[...] } ou null. Coleta TODOS os ids possiveis (id do registro E id interno,
 // sempre como numero) para casar com appts mesmo havendo cadastro duplicado ou tipo diferente (string x numero).
@@ -423,6 +434,8 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
         const msg = messages[0];
         const from = msg.from;
         const tipo = msg.type;
+        // Reentrega da Meta (mesmo wamid): ja processada -> responde ok e nao repete nada
+        if (msg.id && mensagemJaProcessada(msg.id)) return res.status(200).json({ status: 'ok' });
         // Conversas: salvar TODA mensagem recebida (a prova de falha; nao depende dos filtros de acao)
         var _txtIn = '';
         if (tipo === 'text') _txtIn = (msg.text && msg.text.body) || '';
