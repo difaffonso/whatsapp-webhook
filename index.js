@@ -72,7 +72,7 @@ async function atualizarStatusConsulta(telefone, novoStatus) {
   try {
     // 1) achar paciente pelo telefone (tabela patients, separada do clinic_data)
     var pac = await buscarPacientePorTelefone(telefone);
-    if (!pac || !pac.ids || !pac.ids.length) return { ok: false, motivo: 'paciente nao encontrado' };
+    if (!pac || !pac.ids || !pac.ids.length) { console.log('[confirmacao] paciente nao encontrado para', telefone); return { ok: false, motivo: 'paciente nao encontrado' }; }
     var idSet = {};
     pac.ids.forEach(function (i) { idSet[Number(i)] = true; });
 
@@ -98,7 +98,7 @@ async function atualizarStatusConsulta(telefone, novoStatus) {
     });
     var alvo = candidatas.find(function (a) { return a.date === amanhaStr; })
       || candidatas.filter(function (a) { return a.date >= hojeStr; }).sort(function (a, b) { return a.date.localeCompare(b.date); })[0];
-    if (!alvo) return { ok: false, motivo: 'consulta nao encontrada', nome: pac.nome };
+    if (!alvo) { console.log('[confirmacao] consulta nao encontrada para', telefone, 'ids:', JSON.stringify(pac.ids), 'candidatas:', candidatas.length); return { ok: false, motivo: 'consulta nao encontrada', nome: pac.nome }; }
 
     // 4) aplicar novo status
     var novoAppts = appts.map(function (a) {
@@ -414,6 +414,12 @@ app.get('/api/webhook/whatsapp', (req, res) => {
 
 // Receber mensagens
 app.post('/api/webhook/whatsapp', async (req, res) => {
+  // Ack imediato: a Meta reenvia o webhook se a resposta demorar; respondemos 200 ja
+  // e seguimos processando. As chamadas res.* abaixo viram no-op (evita erro de resposta dupla).
+  res.status(200).json({ status: 'ok' });
+  res.status = function () { return res; };
+  res.json = function () { return res; };
+  res.sendStatus = function () { return res; };
   try {
     const body = req.body;
     if (body.object === 'whatsapp_business_account') {
@@ -512,6 +518,34 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
     console.error('Erro:', err);
     res.status(200).json({ status: 'ok' });
   }
+});
+
+// Diagnostico: mostra o que o webhook enxerga para um telefone (protegido pela DISPARO_KEY)
+app.get('/api/diag', async (req, res) => {
+  try {
+    if ((req.query.key || '') !== DISPARO_KEY) return res.status(403).json({ ok: false, error: 'key invalida' });
+    var fone = String(req.query.fone || '');
+    var out = { fone: fone, usandoServiceKey: !!process.env.SUPABASE_SERVICE_KEY };
+    var sp = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Sao_Paulo" }));
+    out.hoje = sp.toISOString().split('T')[0];
+    var pac = await buscarPacientePorTelefone(fone);
+    out.paciente = pac ? { nome: pac.nome, ids: pac.ids } : null;
+    var r = await fetch(SUPA_URL + "/rest/v1/clinic_data?id=eq.main&select=data", {
+      headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY }
+    });
+    var rows = await r.json();
+    var data = (rows && rows[0] && rows[0].data) || null;
+    out.clinicDataOk = !!data;
+    var appts = (data && data.appts) || [];
+    out.totalConsultas = appts.length;
+    if (pac && pac.ids && pac.ids.length) {
+      var idSet = {};
+      pac.ids.forEach(function (i) { idSet[Number(i)] = true; });
+      out.consultasDoPaciente = appts.filter(function (a) { return idSet[Number(a.patientId)]; })
+        .map(function (a) { return { id: a.id, date: a.date, time: a.time, status: a.status, patientId: a.patientId }; });
+    }
+    return res.json(out);
+  } catch (e) { return res.status(500).json({ ok: false, error: String(e && e.message) }); }
 });
 
 app.get('/', (req, res) => {
