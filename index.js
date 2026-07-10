@@ -754,6 +754,7 @@ async function rodarAutomaticos(dry) {
   if (!cfg.master) return { ok: true, pulado: 'interruptor geral (master) desligado', resumo: {} };
 
   var pacientes = await _carregarPacientes();
+  _patCache = { porId: pacientes.porId, ts: Date.now() };
   var fila = _montarFila(data, pacientes, t, tm, y);
 
   var resumo = {};
@@ -806,6 +807,75 @@ cron.schedule('0 12 * * *', function () {
     console.log('[auto] concluido:', JSON.stringify(r && { resumo: r.resumo, enviados: r.enviados, erros: r.erros, pulado: r.pulado }));
   }).catch(function (e) { console.error('[auto] erro no agendador:', e); });
 }, { timezone: 'America/Sao_Paulo' });
+
+
+// ============================================================
+// VARREDURA LEVE DE VÉSPERA (além do lote das 12h)
+// Pega consultas de amanhã marcadas DEPOIS das 12h. Roda de hora
+// em hora, das 13h às 20h. Lê só o necessário (NÃO os 10 mil pacientes):
+// usa um cache de pacientes em memória, atualizado no lote das 12h.
+// ============================================================
+var _patCache = { porId: {}, ts: 0 };
+async function _atualizarCachePacientes() {
+  try {
+    var pac = await _carregarPacientes();
+    _patCache = { porId: pac.porId, ts: Date.now() };
+    console.log('[auto] cache de pacientes atualizado:', pac.lista.length);
+  } catch (e) { console.error('[auto] erro ao atualizar cache de pacientes:', e); }
+}
+
+async function rodarVespera() {
+  try {
+    var t = _spDateStr(0), tm = _spDateStr(1);
+    // lê SÓ os campos necessários do blob (sub-path JSONB) — leve, não baixa o blob inteiro
+    var r = await fetch(SUPA_URL + "/rest/v1/clinic_data?id=eq.main&select=appts:data->appts,waSent:data->waSent,waAuto:data->waAuto,dents:data->dents,waAutoLog:data->waAutoLog", {
+      headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY }
+    });
+    var rows = await r.json();
+    var d0 = rows && rows[0]; if (!d0) return;
+    var cfg = d0.waAuto || {};
+    if (!cfg.master || !cfg.vespera) return;
+    var appts = d0.appts || [], sent = d0.waSent || {}, dents = d0.dents || [];
+    var dOf = function (id) { return dents.find(function (x) { return x.id === Number(id); }) || dents[0] || { name: "Diego Affonso" }; };
+    var jaHoje = 0;
+    (d0.waAutoLog || []).forEach(function (l) { if ((l.ts || '').slice(0, 10) === t && l.tipo === 'Véspera') jaHoje++; });
+
+    // consultas de amanhã, elegíveis e que AINDA não receberam o lembrete
+    var alvos = appts.filter(function (a) {
+      return a.date === tm && !a.blocked && (a.status === 'pending' || a.status === 'confirmed') && !sent['v_' + a.id + '_' + a.date];
+    });
+    if (!alvos.length) return;
+
+    if (!_patCache.ts) await _atualizarCachePacientes();
+    var porId = _patCache.porId || {};
+
+    var enviados = 0, waSentNovo = {}, novosLogs = [];
+    for (var i = 0; i < alvos.length; i++) {
+      if (jaHoje + enviados >= WA_MAX_POR_TIPO) break;
+      var a = alvos[i];
+      var p = porId[Number(a.patientId)];
+      if (!p || !p.phone) continue; // paciente novo fora do cache: já recebeu a Confirmação ao agendar
+      var d = dOf(a.dentistId);
+      var fone = _normFone(p.phone);
+      var rr = await enviarTemplate(fone, 'lembrete_vespera', [p.name, _fmtBR(a.date), a.time, d.name]);
+      var ok = !!(rr && rr.ok);
+      if (ok) { enviados++; waSentNovo['v_' + a.id + '_' + a.date] = t; }
+      novosLogs.push({ ts: new Date().toISOString(), tipo: 'Véspera', pat: p.name, fone: fone, ok: ok, err: (rr && rr.error) || '' });
+      console.log('[auto/vespera] ' + (ok ? 'OK' : 'ERRO') + ' ' + p.name + ' ' + fone + (ok ? '' : (' :: ' + ((rr && rr.error) || '?'))));
+      await new Promise(function (res) { setTimeout(res, 1300); });
+    }
+    if (novosLogs.length) await _gravarWa(waSentNovo, novosLogs, false);
+  } catch (e) { console.error('[auto/vespera] erro:', e); }
+}
+
+// Varreduras de véspera: de hora em hora, das 13h às 20h (SP) — pegam marcações feitas depois do lote das 12h.
+cron.schedule('0 13-20 * * *', function () {
+  console.log('[auto/vespera] varredura horaria...');
+  rodarVespera();
+}, { timezone: 'America/Sao_Paulo' });
+
+// aquece o cache de pacientes ao subir o servidor (varreduras já funcionam antes do lote das 12h)
+_atualizarCachePacientes();
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
