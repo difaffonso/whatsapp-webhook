@@ -1,4 +1,5 @@
 const express = require('express');
+const cron = require('node-cron');
 const app = express();
 
 app.use(express.json());
@@ -552,6 +553,259 @@ app.get('/api/diag', async (req, res) => {
 app.get('/', (req, res) => {
   res.send('WhatsApp Webhook ativo!');
 });
+
+
+// ============================================================
+// AGENDADOR: envios automáticos diários pelo próprio servidor
+// (véspera, aniversário, semestral, pós-cirurgia, pós-consulta,
+// orçamento). Roda todo dia às 12h (horário de São Paulo),
+// independente do app estar aberto. Replica as MESMAS regras do app.
+// ============================================================
+
+// Limite de mensagens por tipo por dia (proteção de custo/bloqueio da Meta).
+// Ajuste pela variável de ambiente WA_MAX_POR_TIPO se precisar de mais.
+const WA_MAX_POR_TIPO = Number(process.env.WA_MAX_POR_TIPO) || 100;
+
+// Datas no fuso de São Paulo (Brasil sem horário de verão -> offset fixo -03).
+function _spDateStr(offsetDays) {
+  var d = new Date(Date.now() + (offsetDays || 0) * 86400000);
+  var p = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Sao_Paulo', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(d);
+  var g = function (t) { return (p.find(function (x) { return x.type === t; }) || {}).value; };
+  return g('year') + '-' + g('month') + '-' + g('day');
+}
+function _fmtBR(ymd) { if (!ymd) return '-'; var s = String(ymd).split('-'); return s.length === 3 ? (s[2] + '/' + s[1] + '/' + s[0]) : ymd; }
+function _moN(ymd, n) { var x = new Date(ymd + 'T12:00:00Z'); x.setUTCMonth(x.getUTCMonth() + (Number(n) || 6)); return x.toISOString().split('T')[0]; }
+function _retMonths(p) { var m = Number(p && p.retMeses); return (m && m > 0) ? m : 6; }
+function _retDue(p, lastDate) { if (!lastDate) return null; if (p && p.retData && p.retData >= lastDate) return p.retData; return _moN(lastDate, _retMonths(p)); }
+function _diasEntre(aYmd, bYmd) { return Math.floor((new Date(aYmd + 'T12:00:00Z') - new Date(bYmd + 'T12:00:00Z')) / 86400000); }
+function _normFone(fone) { var to = soDigitos(fone); if (to.length === 11 || to.length === 10) to = '55' + to; return to; }
+
+// procedimentos considerados cirúrgicos (mesma lista do app)
+var PCIR_WA = ["extra", "exodont", "cirurg", "implante", "enxerto", "sinus", "frenectomia", "apicectomia", "biopsia", "gengivo"];
+
+async function _lerClinicData() {
+  var r = await fetch(SUPA_URL + "/rest/v1/clinic_data?id=eq.main&select=data", {
+    headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY }
+  });
+  var rows = await r.json();
+  return (rows && rows[0] && rows[0].data) || null;
+}
+
+// Carrega TODOS os pacientes (tabela patients). porId aceita id do registro E data.id.
+async function _carregarPacientes() {
+  var lista = [], porId = {};
+  var lastId = 0, step = 1000;
+  for (var guard = 0; guard < 500; guard++) {
+    var r = await fetch(SUPA_URL + "/rest/v1/patients?select=id,data&order=id.asc&limit=" + step + "&id=gt." + lastId, {
+      headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY }
+    });
+    if (!r.ok) break;
+    var rows = await r.json();
+    if (!rows || !rows.length) break;
+    for (var k = 0; k < rows.length; k++) {
+      var pd = rows[k].data; if (!pd) continue;
+      var ids = [];
+      if (rows[k].id != null) ids.push(Number(rows[k].id));
+      if (pd.id != null) ids.push(Number(pd.id));
+      ids = ids.filter(function (v, i, a) { return !isNaN(v) && a.indexOf(v) === i; });
+      lista.push({ p: pd, ids: ids });
+      ids.forEach(function (i) { if (porId[i] === undefined) porId[i] = pd; });
+    }
+    lastId = rows[rows.length - 1].id;
+    if (rows.length < step) break;
+  }
+  return { lista: lista, porId: porId };
+}
+
+// Monta a fila de envios (mesmas regras do app). Não envia — só decide quem recebe o quê.
+function _montarFila(data, pacientes, t, tm, y) {
+  var cfg = data.waAuto || {};
+  var sent = Object.assign({}, data.waSent || {});
+  var dents = data.dents || [];
+  var appts = data.appts || [];
+  var recs = data.recs || [];
+  var budgets = data.budgets || [];
+  var dOf = function (id) { return dents.find(function (x) { return x.id === Number(id); }) || dents[0] || { name: "Diego Affonso" }; };
+
+  var logHoje = {};
+  (data.waAutoLog || []).forEach(function (l) { if ((l.ts || '').slice(0, 10) === t) logHoje[l.tipo] = (logHoje[l.tipo] || 0) + 1; });
+
+  var fila = [];
+  var jaNaFila = {};
+  var addJob = function (tipoLabel, key, template, fone, params, patName) {
+    if (!fone) return;
+    if (sent[key] || jaNaFila[key]) return;
+    if ((logHoje[tipoLabel] || 0) >= WA_MAX_POR_TIPO) return;
+    logHoje[tipoLabel] = (logHoje[tipoLabel] || 0) + 1;
+    jaNaFila[key] = true;
+    fila.push({ tipoLabel: tipoLabel, key: key, template: template, fone: _normFone(fone), params: params, patName: patName });
+  };
+
+  // 1) VÉSPERA — consultas de amanhã, Pendente/Confirmada
+  if (cfg.vespera) {
+    appts.forEach(function (a) {
+      if (a.date !== tm || a.blocked) return;
+      if (a.status !== 'pending' && a.status !== 'confirmed') return;
+      var p = pacientes.porId[Number(a.patientId)]; if (!p || !p.phone) return;
+      var d = dOf(a.dentistId);
+      addJob("Véspera", "v_" + a.id + "_" + a.date, "lembrete_vespera", p.phone, [p.name, _fmtBR(a.date), a.time, d.name], p.name);
+    });
+  }
+
+  // 2) ANIVERSÁRIO — aniversariantes de hoje
+  if (cfg.aniversario) {
+    var ano = t.slice(0, 4);
+    pacientes.lista.forEach(function (reg) {
+      var p = reg.p;
+      if (!p.dob || p.dob.slice(5) !== t.slice(5)) return;
+      if (!p.phone) return;
+      var pid = (p.id != null) ? p.id : reg.ids[0];
+      addJob("Aniversário", "a_" + pid + "_" + ano, "aniversario_paciente", p.phone, [p.name], p.name);
+    });
+  }
+
+  // 3) SEMESTRAL — 6 meses após último atend. pago, sem consulta futura
+  if (cfg.semestral) {
+    pacientes.lista.forEach(function (reg) {
+      var p = reg.p; if (!p.phone) return;
+      var idSet = {}; reg.ids.forEach(function (i) { idSet[i] = true; });
+      var last = recs.filter(function (r) { return idSet[Number(r.patientId)] && r.paid > 0; }).sort(function (a, b) { return String(b.date).localeCompare(String(a.date)); })[0];
+      if (!last) return;
+      if (_retDue(p, last.date) > t) return;
+      var fut = appts.find(function (a) { return idSet[Number(a.patientId)] && a.date >= t && a.status !== 'cancelled' && a.status !== 'missed'; });
+      if (fut) return;
+      var d = dOf(last.dentistId);
+      var pid = (p.id != null) ? p.id : reg.ids[0];
+      addJob("Semestral", "s_" + pid, "controle_semestral", p.phone, [p.name, d.name], p.name);
+    });
+  }
+
+  // 4) PÓS-CIRURGIA / PÓS-CONSULTA — consultas de ontem (done/confirmed)
+  if (cfg.poscirurgia || cfg.posconsulta) {
+    appts.forEach(function (a) {
+      if (a.date !== y || a.blocked) return;
+      if (a.status !== 'done' && a.status !== 'confirmed') return;
+      var p = pacientes.porId[Number(a.patientId)]; if (!p || !p.phone) return;
+      var pid = (p.id != null) ? p.id : Number(a.patientId);
+      var isCir = PCIR_WA.some(function (w) { return (a.procedure || '').toLowerCase().indexOf(w) >= 0; });
+      var d = dOf(a.dentistId);
+      if (isCir && cfg.poscirurgia) {
+        addJob("Pós-cirurgia", "pc_" + a.id, "pos__procedimento_", p.phone, [p.name, d.name, a.procedure || 'procedimento'], p.name);
+      } else if (!isCir && cfg.posconsulta && a.status === 'done') {
+        var psk = "ps_" + pid;
+        var psLast = sent[psk];
+        var psDias = psLast ? _diasEntre(t, psLast) : 99999;
+        if (psDias >= 180) { delete sent[psk]; addJob("Pós-consulta", psk, "pos__consulta", p.phone, [p.name, d.name], p.name); }
+      }
+    });
+  }
+
+  // 5) ORÇAMENTO — orçamentos Em espera há 3+ dias
+  if (cfg.orcamento) {
+    var limS = _spDateStr(-3);
+    budgets.forEach(function (b) {
+      if (b.status !== 'pending') return;
+      if ((b.date || '') > limS) return;
+      var p = pacientes.porId[Number(b.patientId)]; if (!p || !p.phone) return;
+      var d = dOf(b.dentistId);
+      addJob("Orçamento", "o_" + b.id, "orcamento_pendente", p.phone, [p.name, d.name], p.name);
+    });
+  }
+
+  return fila;
+}
+
+// Remove chaves antigas do waSent (mesma retenção do app), para não crescer sem fim.
+function _purgarWaSent(sent, t) {
+  var keep = {};
+  Object.keys(sent || {}).forEach(function (k) {
+    var ds = sent[k];
+    var dias = _diasEntre(t, ds);
+    var max = k.slice(0, 3) === 'ps_' ? 190 : (k.slice(0, 2) === 'a_' ? 400 : (k.slice(0, 2) === 's_' ? 200 : 120));
+    if (dias <= max) keep[k] = ds;
+  });
+  return keep;
+}
+
+// Grava SOMENTE waSent + waAutoLog, relendo o blob na hora (merge seguro, não sobrescreve o app).
+async function _gravarWa(waSentNovo, novosLogs, purgar) {
+  try {
+    var atual = await _lerClinicData();
+    if (!atual) return false;
+    var waSent = Object.assign({}, atual.waSent || {}, waSentNovo || {});
+    if (purgar) waSent = _purgarWaSent(waSent, _spDateStr(0));
+    var log = (novosLogs || []).concat(atual.waAutoLog || []).slice(0, 300);
+    var novoData = Object.assign({}, atual, { waSent: waSent, waAutoLog: log });
+    var rs = await fetch(SUPA_URL + "/rest/v1/clinic_data?id=eq.main", {
+      method: "PATCH",
+      headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY, "Content-Type": "application/json", "Prefer": "return=minimal" },
+      body: JSON.stringify({ data: novoData, updated_at: new Date().toISOString() })
+    });
+    return rs.ok;
+  } catch (e) { console.error('_gravarWa erro:', e); return false; }
+}
+
+// Execução principal. dry=true -> só simula (não envia, não grava).
+async function rodarAutomaticos(dry) {
+  var t = _spDateStr(0), tm = _spDateStr(1), y = _spDateStr(-1);
+  var data = await _lerClinicData();
+  if (!data) return { ok: false, erro: 'clinic_data indisponível' };
+  var cfg = data.waAuto || {};
+  if (!cfg.master) return { ok: true, pulado: 'interruptor geral (master) desligado', resumo: {} };
+
+  var pacientes = await _carregarPacientes();
+  var fila = _montarFila(data, pacientes, t, tm, y);
+
+  var resumo = {};
+  fila.forEach(function (j) { resumo[j.tipoLabel] = (resumo[j.tipoLabel] || 0) + 1; });
+
+  if (dry) {
+    return {
+      ok: true, dry: true, datas: { hoje: t, amanha: tm, ontem: y }, totalPacientes: pacientes.lista.length,
+      resumo: resumo, totalFila: fila.length,
+      itens: fila.map(function (j) { return { tipo: j.tipoLabel, pat: j.patName, fone: j.fone, template: j.template }; })
+    };
+  }
+
+  var enviados = 0, erros = 0;
+  var waSentNovo = {}, novosLogs = [], pendentes = 0;
+  for (var i = 0; i < fila.length; i++) {
+    var j = fila[i];
+    var r = await enviarTemplate(j.fone, j.template, j.params);
+    var okEnvio = !!(r && r.ok);
+    if (okEnvio) { enviados++; waSentNovo[j.key] = t; } else { erros++; }
+    novosLogs.push({ ts: new Date().toISOString(), tipo: j.tipoLabel, pat: j.patName, fone: j.fone, ok: okEnvio, err: (r && r.error) || '' });
+    console.log('[auto] ' + (okEnvio ? 'OK' : 'ERRO') + ' ' + j.tipoLabel + ' ' + j.patName + ' ' + j.fone + (okEnvio ? '' : (' :: ' + ((r && r.error) || '?'))));
+    pendentes++;
+    if (pendentes >= 20) { await _gravarWa(waSentNovo, novosLogs, false); waSentNovo = {}; novosLogs = []; pendentes = 0; }
+    await new Promise(function (res) { setTimeout(res, 1300); });
+  }
+  await _gravarWa(waSentNovo, novosLogs, true); // grava o restante + purga chaves antigas
+  return { ok: true, datas: { hoje: t, amanha: tm, ontem: y }, resumo: resumo, enviados: enviados, erros: erros, totalFila: fila.length };
+}
+
+// Endpoint manual (protegido pela DISPARO_KEY):
+//   Simular (não envia):  GET /api/rodar-automaticos?key=SUA_KEY&dry=1
+//   Rodar de verdade:     GET /api/rodar-automaticos?key=SUA_KEY
+app.get('/api/rodar-automaticos', async (req, res) => {
+  try {
+    if ((req.query.key || '') !== DISPARO_KEY) return res.status(403).json({ ok: false, error: 'key invalida' });
+    var dry = String(req.query.dry || '') === '1' || String(req.query.dry || '').toLowerCase() === 'true';
+    if (dry) { var out = await rodarAutomaticos(true); return res.json(out); }
+    rodarAutomaticos(false).then(function (r) {
+      console.log('[auto/manual] fim:', JSON.stringify({ resumo: r.resumo, enviados: r.enviados, erros: r.erros }));
+    }).catch(function (e) { console.error('[auto/manual] erro:', e); });
+    return res.json({ ok: true, iniciado: true, aviso: 'Envio real rodando em segundo plano. Veja o resultado em Administrativo > WhatsApp (log) ou nos Logs do Railway.' });
+  } catch (e) { return res.status(500).json({ ok: false, error: String(e && e.message) }); }
+});
+
+// Agendador diário: todo dia às 12h00 (horário de São Paulo).
+cron.schedule('0 12 * * *', function () {
+  console.log('[auto] disparando envios automáticos das 12h (SP)...');
+  rodarAutomaticos(false).then(function (r) {
+    console.log('[auto] concluido:', JSON.stringify(r && { resumo: r.resumo, enviados: r.enviados, erros: r.erros, pulado: r.pulado }));
+  }).catch(function (e) { console.error('[auto] erro no agendador:', e); });
+}, { timezone: 'America/Sao_Paulo' });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
