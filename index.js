@@ -68,6 +68,67 @@ async function buscarPacientePorTelefone(telefone) {
   }
 }
 
+// Monta o patch de status (carimbo _ts NOVO a cada chamada: vence o merge do app)
+function montarPatchStatus(novoStatus) {
+  var patch = { status: novoStatus };
+  patch._ts = Date.now(); // carimbo anti-overwrite: sem isso o app aberto reverte o status no proximo save/merge
+  if (novoStatus === 'cancelled') {
+    patch.canceladoWA = true;
+    patch.canceladoWAts = new Date().toISOString();
+    patch.motivoCancel = 'Cancelou pelo WhatsApp';
+    patch.noRebook = false;
+    patch.waCancelVisto = false;
+  }
+  if (novoStatus === 'confirmed') {
+    patch.confirmadoWA = true;
+    patch.confirmadoWAts = new Date().toISOString();
+  }
+  return patch;
+}
+
+// ============================================================
+// VIGIA DE STATUS (correcao 14/07/2026): o app aberto na clinica salva
+// o blob INTEIRO a cada alteracao. Se esse save acontecer na janela de
+// segundos em que o servidor gravou a confirmacao/cancelamento do
+// paciente (antes de o app ter puxado a mudanca no poll), o save do app
+// REVERTE o status. Solucao: apos gravar, o servidor confere de novo
+// aos 15s, 40s e 90s e REAPLICA se foi revertido — com _ts novo, que
+// vence o merge do app. Reaplica SOMENTE se o status atual for
+// pending/confirmed (estado pre-resposta): nunca briga com uma mudanca
+// feita de proposito por um usuario na agenda (done, missed etc.).
+// ============================================================
+function _vigiarStatus(apptId, novoStatus) {
+  var esperas = [15000, 40000, 90000];
+  var passo = function (i) {
+    if (i >= esperas.length) return;
+    setTimeout(async function () {
+      try {
+        var data = await _lerClinicData();
+        if (!data) return passo(i + 1);
+        var appts = data.appts || [];
+        var a = appts.find(function (x) { return x && x.id === apptId; });
+        if (!a) return; // consulta removida: nao insiste
+        if (a.status === novoStatus) return passo(i + 1); // ok, segue vigiando
+        // revertido pelo app? so reaplica se voltou ao estado pre-resposta
+        if (a.status !== 'pending' && a.status !== 'confirmed') return; // mudanca humana: respeita
+        var novoAppts = appts.map(function (x) {
+          if (!x || x.id !== apptId) return x;
+          return Object.assign({}, x, montarPatchStatus(novoStatus));
+        });
+        var novoData = Object.assign({}, data, { appts: novoAppts });
+        var rs = await fetch(SUPA_URL + "/rest/v1/clinic_data?id=eq.main", {
+          method: "PATCH",
+          headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY, "Content-Type": "application/json", "Prefer": "return=minimal" },
+          body: JSON.stringify({ data: novoData, updated_at: new Date().toISOString() })
+        });
+        console.log('[vigia] status da consulta ' + apptId + ' foi revertido pelo app; reaplicado "' + novoStatus + '" (tentativa ' + (i + 1) + '): ' + (rs.ok ? 'OK' : 'FALHOU'));
+        passo(i + 1);
+      } catch (e) { console.error('[vigia] erro:', e); passo(i + 1); }
+    }, esperas[i]);
+  };
+  passo(0);
+}
+
 // Atualiza status da consulta de amanha (ou a mais proxima futura) do paciente
 async function atualizarStatusConsulta(telefone, novoStatus) {
   try {
@@ -104,20 +165,7 @@ async function atualizarStatusConsulta(telefone, novoStatus) {
     // 4) aplicar novo status
     var novoAppts = appts.map(function (a) {
       if (a.id !== alvo.id) return a;
-      var patch = { status: novoStatus };
-      patch._ts = Date.now(); // carimbo anti-overwrite: sem isso o app aberto reverte o status no proximo save/merge
-      if (novoStatus === 'cancelled') {
-        patch.canceladoWA = true;
-        patch.canceladoWAts = new Date().toISOString();
-        patch.motivoCancel = 'Cancelou pelo WhatsApp';
-        patch.noRebook = false;
-        patch.waCancelVisto = false;
-      }
-      if (novoStatus === 'confirmed') {
-        patch.confirmadoWA = true;
-        patch.confirmadoWAts = new Date().toISOString();
-      }
-      return Object.assign({}, a, patch);
+      return Object.assign({}, a, montarPatchStatus(novoStatus));
     });
     var novoData = Object.assign({}, data, { appts: novoAppts });
 
@@ -128,6 +176,7 @@ async function atualizarStatusConsulta(telefone, novoStatus) {
       body: JSON.stringify({ data: novoData, updated_at: new Date().toISOString() })
     });
     if (!rs.ok) return { ok: false, motivo: 'falha ao salvar', nome: pac.nome };
+    _vigiarStatus(alvo.id, novoStatus); // vigia em segundo plano: reaplica se o app sobrescrever
     return { ok: true, nome: pac.nome, date: alvo.date, time: alvo.time, proc: alvo.procedure || '' };
   } catch (e) {
     console.error('atualizarStatusConsulta erro:', e);
@@ -745,6 +794,43 @@ async function _gravarWa(waSentNovo, novosLogs, purgar) {
   } catch (e) { console.error('_gravarWa erro:', e); return false; }
 }
 
+// ============================================================
+// DEDUP DO SERVIDOR (correção véspera duplicada — 14/07/2026):
+// o waSent dentro do blob 'main' pode ser apagado pelo app aberto
+// (save de blob inteiro sobrescreve as marcações feitas pelo servidor).
+// Por isso o servidor mantém uma CÓPIA PRÓPRIA das marcações num
+// registro separado (id='wa_sent_srv') na mesma tabela clinic_data,
+// que o app NUNCA lê nem grava. Antes de qualquer envio automático,
+// o servidor consulta as DUAS fontes (blob + registro próprio).
+// ============================================================
+async function _lerSentSrv() {
+  try {
+    var r = await fetch(SUPA_URL + "/rest/v1/clinic_data?id=eq.wa_sent_srv&select=data", {
+      headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY }
+    });
+    if (!r.ok) return {};
+    var rows = await r.json();
+    return (rows && rows[0] && rows[0].data) || {};
+  } catch (e) { console.error('_lerSentSrv erro:', e); return {}; }
+}
+
+async function _gravarSentSrv(novos, purgar) {
+  try {
+    if ((!novos || !Object.keys(novos).length) && !purgar) return true;
+    var atual = await _lerSentSrv();
+    var m = Object.assign({}, atual, novos || {});
+    if (purgar) m = _purgarWaSent(m, _spDateStr(0));
+    // upsert: cria o registro na primeira vez, atualiza nas seguintes
+    var rs = await fetch(SUPA_URL + "/rest/v1/clinic_data?on_conflict=id", {
+      method: "POST",
+      headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY, "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal" },
+      body: JSON.stringify({ id: "wa_sent_srv", data: m, updated_at: new Date().toISOString() })
+    });
+    if (!rs.ok) console.error('_gravarSentSrv falhou:', rs.status);
+    return rs.ok;
+  } catch (e) { console.error('_gravarSentSrv erro:', e); return false; }
+}
+
 // Execução principal. dry=true -> só simula (não envia, não grava).
 async function rodarAutomaticos(dry) {
   var t = _spDateStr(0), tm = _spDateStr(1), y = _spDateStr(-1);
@@ -752,6 +838,10 @@ async function rodarAutomaticos(dry) {
   if (!data) return { ok: false, erro: 'clinic_data indisponível' };
   var cfg = data.waAuto || {};
   if (!cfg.master) return { ok: true, pulado: 'interruptor geral (master) desligado', resumo: {} };
+
+  // dedup do servidor: une as marcações próprias (que o app não consegue apagar) às do blob
+  var sentSrv = await _lerSentSrv();
+  data.waSent = Object.assign({}, data.waSent || {}, sentSrv);
 
   var pacientes = await _carregarPacientes();
   _patCache = { porId: pacientes.porId, ts: Date.now() };
@@ -774,14 +864,15 @@ async function rodarAutomaticos(dry) {
     var j = fila[i];
     var r = await enviarTemplate(j.fone, j.template, j.params);
     var okEnvio = !!(r && r.ok);
-    if (okEnvio) { enviados++; waSentNovo[j.key] = t; } else { erros++; }
+    if (okEnvio) { enviados++; waSentNovo[j.key] = t; }
     novosLogs.push({ ts: new Date().toISOString(), tipo: j.tipoLabel, pat: j.patName, fone: j.fone, ok: okEnvio, err: (r && r.error) || '' });
     console.log('[auto] ' + (okEnvio ? 'OK' : 'ERRO') + ' ' + j.tipoLabel + ' ' + j.patName + ' ' + j.fone + (okEnvio ? '' : (' :: ' + ((r && r.error) || '?'))));
     pendentes++;
-    if (pendentes >= 20) { await _gravarWa(waSentNovo, novosLogs, false); waSentNovo = {}; novosLogs = []; pendentes = 0; }
+    if (pendentes >= 20) { await _gravarWa(waSentNovo, novosLogs, false); await _gravarSentSrv(waSentNovo, false); waSentNovo = {}; novosLogs = []; pendentes = 0; }
     await new Promise(function (res) { setTimeout(res, 1300); });
   }
   await _gravarWa(waSentNovo, novosLogs, true); // grava o restante + purga chaves antigas
+  await _gravarSentSrv(waSentNovo, true); // grava também na cópia do servidor (à prova de overwrite do app)
   return { ok: true, datas: { hoje: t, amanha: tm, ontem: y }, resumo: resumo, enviados: enviados, erros: erros, totalFila: fila.length };
 }
 
@@ -836,6 +927,10 @@ async function rodarVespera() {
     var cfg = d0.waAuto || {};
     if (!cfg.master || !cfg.vespera) return;
     var appts = d0.appts || [], sent = d0.waSent || {}, dents = d0.dents || [];
+    // correção véspera duplicada: o waSent do blob pode ter sido sobrescrito pelo app
+    // (apagando as marcações do servidor). Une a cópia PRÓPRIA do servidor, que o app não toca.
+    var sentSrv = await _lerSentSrv();
+    sent = Object.assign({}, sent, sentSrv);
     var dOf = function (id) { return dents.find(function (x) { return x.id === Number(id); }) || dents[0] || { name: "Diego Affonso" }; };
     var jaHoje = 0;
     (d0.waAutoLog || []).forEach(function (l) { if ((l.ts || '').slice(0, 10) === t && l.tipo === 'Véspera') jaHoje++; });
@@ -864,7 +959,10 @@ async function rodarVespera() {
       console.log('[auto/vespera] ' + (ok ? 'OK' : 'ERRO') + ' ' + p.name + ' ' + fone + (ok ? '' : (' :: ' + ((rr && rr.error) || '?'))));
       await new Promise(function (res) { setTimeout(res, 1300); });
     }
-    if (novosLogs.length) await _gravarWa(waSentNovo, novosLogs, false);
+    if (novosLogs.length) {
+      await _gravarWa(waSentNovo, novosLogs, false);
+      await _gravarSentSrv(waSentNovo, false); // cópia do servidor: garante que a próxima varredura NÃO reenvia
+    }
   } catch (e) { console.error('[auto/vespera] erro:', e); }
 }
 
