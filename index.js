@@ -68,9 +68,24 @@ async function buscarPacientePorTelefone(telefone) {
   }
 }
 
+// ============================================================
+// CARIMBO DE VERSAO (_vers) — correcao 14/07/2026: o app usa carimbos
+// por chave (data._vers.appts, data._vers.waSent, ...) para saber O QUE
+// baixar no poll de 8s. O servidor gravava appts/waSent SEM atualizar o
+// carimbo -> nenhum aparelho baixava a mudanca -> o proximo save do app
+// gravava a versao antiga por cima, apagando a confirmacao do paciente.
+// Toda escrita do servidor no blob 'main' DEVE carimbar as chaves tocadas.
+// ============================================================
+function _bumpVers(dataObj, chaves) {
+  var v = Object.assign({}, dataObj._vers || {});
+  var agora = new Date().toISOString();
+  (chaves || []).forEach(function (k) { v[k] = agora; });
+  dataObj._vers = v;
+  return dataObj;
+}
+
 // Monta o patch de status (carimbo _ts NOVO a cada chamada: vence o merge do app)
-function montarPatchStatus(novoStatus) {
-  var patch = { status: novoStatus };
+function montarPatchStatus(novoStatus) {  var patch = { status: novoStatus };
   patch._ts = Date.now(); // carimbo anti-overwrite: sem isso o app aberto reverte o status no proximo save/merge
   if (novoStatus === 'cancelled') {
     patch.canceladoWA = true;
@@ -115,7 +130,7 @@ function _vigiarStatus(apptId, novoStatus) {
           if (!x || x.id !== apptId) return x;
           return Object.assign({}, x, montarPatchStatus(novoStatus));
         });
-        var novoData = Object.assign({}, data, { appts: novoAppts });
+        var novoData = _bumpVers(Object.assign({}, data, { appts: novoAppts }), ['appts']); // carimba: app baixa a mudanca no proximo poll
         var rs = await fetch(SUPA_URL + "/rest/v1/clinic_data?id=eq.main", {
           method: "PATCH",
           headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY, "Content-Type": "application/json", "Prefer": "return=minimal" },
@@ -167,7 +182,7 @@ async function atualizarStatusConsulta(telefone, novoStatus) {
       if (a.id !== alvo.id) return a;
       return Object.assign({}, a, montarPatchStatus(novoStatus));
     });
-    var novoData = Object.assign({}, data, { appts: novoAppts });
+    var novoData = _bumpVers(Object.assign({}, data, { appts: novoAppts }), ['appts']); // carimba: app baixa a mudanca no proximo poll
 
     // 5) salvar de volta
     var rs = await fetch(SUPA_URL + "/rest/v1/clinic_data?id=eq.main", {
@@ -784,7 +799,7 @@ async function _gravarWa(waSentNovo, novosLogs, purgar) {
     var waSent = Object.assign({}, atual.waSent || {}, waSentNovo || {});
     if (purgar) waSent = _purgarWaSent(waSent, _spDateStr(0));
     var log = (novosLogs || []).concat(atual.waAutoLog || []).slice(0, 300);
-    var novoData = Object.assign({}, atual, { waSent: waSent, waAutoLog: log });
+    var novoData = _bumpVers(Object.assign({}, atual, { waSent: waSent, waAutoLog: log }), ['waSent', 'waAutoLog']); // carimba: app baixa e nao apaga as marcacoes do servidor
     var rs = await fetch(SUPA_URL + "/rest/v1/clinic_data?id=eq.main", {
       method: "PATCH",
       headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY, "Content-Type": "application/json", "Prefer": "return=minimal" },
