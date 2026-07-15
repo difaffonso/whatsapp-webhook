@@ -346,6 +346,18 @@ function setCors(res) {
   res.set("Access-Control-Allow-Headers", "Content-Type, x-api-key");
 }
 
+// Rotulo salvo nas Conversas para cada template (16/07/2026): antes tudo era
+// gravado como "Lembrete de confirmacao", o que confundia a equipe e impedia
+// as cores da aba Conversas de classificarem o tipo certo.
+const WA_ROTULOS = {
+  lembrete_vespera: "\ud83d\udd14 Lembrete de vespera",
+  aniversario_paciente: "\ud83c\udf82 Feliz aniversario",
+  controle_semestral: "\ud83d\udd04 Controle semestral",
+  "pos__procedimento_": "\ud83c\udfe5 Acompanhamento pos-cirurgico",
+  "pos__consulta": "\ud83d\ude0a Pesquisa pos-consulta",
+  orcamento_pendente: "\ud83d\udcb0 Orcamento pendente"
+};
+
 async function enviarTemplate(to, template, params) {
   const idiomas = ['pt_BR', 'pt_PT', 'en_US', 'en'];
   const url = `https://graph.facebook.com/v19.0/${PHONE_NUMBER_ID}/messages`;
@@ -386,7 +398,8 @@ async function enviarTemplate(to, template, params) {
         if (!data.error) {
           console.log('Template OK:', template, lang, 'params:' + ps.length, to);
           var _wamidT = data.messages && data.messages[0] && data.messages[0].id;
-          var _corpo = "\ud83d\udcf2 Lembrete de confirmacao" + (base && base.length ? (": " + base.join(" \u00b7 ")) : "");
+          var _rotulo = WA_ROTULOS[template] || "\ud83d\udcf2 Lembrete de confirmacao"; // templates imediatos do app (agendar/reagendar) mantem o rotulo antigo
+          var _corpo = _rotulo + (base && base.length ? (": " + base.join(" \u00b7 ")) : "");
           salvarMensagem('out', to, _corpo, { status: 'sent', wamid: _wamidT, patient_name: (base && base[0]) ? String(base[0]) : null });
           return { ok: true, lang: lang, id: _wamidT };
         }
@@ -629,6 +642,9 @@ app.get('/', (req, res) => {
 // Limite de mensagens por tipo por dia (proteção de custo/bloqueio da Meta).
 // Ajuste pela variável de ambiente WA_MAX_POR_TIPO se precisar de mais.
 const WA_MAX_POR_TIPO = Number(process.env.WA_MAX_POR_TIPO) || 100;
+// Teto diario ESPECIFICO do orcamento (mais conservador que os demais tipos).
+// Ajustavel pela variavel de ambiente WA_MAX_ORCAMENTO.
+const WA_MAX_ORCAMENTO = Number(process.env.WA_MAX_ORCAMENTO) || 20;
 
 // Datas no fuso de São Paulo (Brasil sem horário de verão -> offset fixo -03).
 function _spDateStr(offsetDays) {
@@ -776,6 +792,48 @@ function _montarFila(data, pacientes, t, tm, y) {
     });
   }
 
+  // 5b) ORÇAMENTO via PLANO DE TRATAMENTO (16/07/2026): a clinica registra os
+  // orcamentos reais como PLANOS DE TRATAMENTO (data.treats), nao na lista
+  // budgets acima (que fica vazia). Regras de seguranca:
+  //   - plano com status "Em espera" e SEM nenhum pagamento
+  //   - referencia: data em que foi marcado "Enviado" (orcEnviadoAt) ou, se nao
+  //     marcado, a data de criacao do plano (start)
+  //   - janela de 3 a 30 dias (nao resgata planos antigos parados)
+  //   - 1 envio por plano (chave ot_) E no maximo 1 mensagem de orcamento por
+  //     paciente (chave op_, trava por ~120 dias) mesmo que tenha varios planos
+  //   - teto diario proprio: WA_MAX_ORCAMENTO (padrao 20)
+  // Dedup identico aos demais tipos: blob + copia do servidor (wa_sent_srv).
+  if (cfg.orcamento) {
+    var treats = data.treats || [];
+    var orcNaRodada = {};
+    var orcCont = 0;
+    treats.forEach(function (tr) {
+      if (!tr) return;
+      var st = tr.orcStatus || 'espera';
+      if (st !== 'espera') return;
+      var pago = (tr.payments || []).reduce(function (s, pg) { return s + (Number(pg.value) || 0); }, 0);
+      if (pago > 0) return;
+      var ref = String(tr.orcEnviadoAt || tr.start || '').slice(0, 10);
+      if (!ref || ref.length !== 10) return;
+      var dias = _diasEntre(t, ref);
+      if (!(dias >= 3 && dias <= 30)) return;
+      var p = pacientes.porId[Number(tr.patientId)]; if (!p || !p.phone) return;
+      var pid = (p.id != null) ? p.id : Number(tr.patientId);
+      if (sent['op_' + pid] || orcNaRodada[pid]) return; // 1 por paciente
+      if (orcCont >= WA_MAX_ORCAMENTO) return; // teto diario proprio
+      var d = dOf(tr.dentistId);
+      var antes = fila.length;
+      addJob("Orçamento", "ot_" + tr.id, "orcamento_pendente", p.phone, [p.name, d.name], p.name);
+      if (fila.length > antes) {
+        orcNaRodada[pid] = true;
+        orcCont++;
+        // grava tambem a trava por paciente quando o envio der certo
+        fila[fila.length - 1].extraKeys = ['op_' + pid];
+        fila[fila.length - 1].det = 'plano de ' + _fmtBR(ref) + ' (' + dias + ' dias em espera)';
+      }
+    });
+  }
+
   return fila;
 }
 
@@ -869,7 +927,7 @@ async function rodarAutomaticos(dry) {
     return {
       ok: true, dry: true, datas: { hoje: t, amanha: tm, ontem: y }, totalPacientes: pacientes.lista.length,
       resumo: resumo, totalFila: fila.length,
-      itens: fila.map(function (j) { return { tipo: j.tipoLabel, pat: j.patName, fone: j.fone, template: j.template }; })
+      itens: fila.map(function (j) { return { tipo: j.tipoLabel, pat: j.patName, fone: j.fone, template: j.template, det: j.det || undefined }; })
     };
   }
 
@@ -879,7 +937,7 @@ async function rodarAutomaticos(dry) {
     var j = fila[i];
     var r = await enviarTemplate(j.fone, j.template, j.params);
     var okEnvio = !!(r && r.ok);
-    if (okEnvio) { enviados++; waSentNovo[j.key] = t; }
+    if (okEnvio) { enviados++; waSentNovo[j.key] = t; (j.extraKeys || []).forEach(function (ek) { waSentNovo[ek] = t; }); }
     novosLogs.push({ ts: new Date().toISOString(), tipo: j.tipoLabel, pat: j.patName, fone: j.fone, ok: okEnvio, err: (r && r.error) || '' });
     console.log('[auto] ' + (okEnvio ? 'OK' : 'ERRO') + ' ' + j.tipoLabel + ' ' + j.patName + ' ' + j.fone + (okEnvio ? '' : (' :: ' + ((r && r.error) || '?'))));
     pendentes++;
@@ -989,6 +1047,79 @@ cron.schedule('0 13-20 * * *', function () {
 
 // aquece o cache de pacientes ao subir o servidor (varreduras já funcionam antes do lote das 12h)
 _atualizarCachePacientes();
+
+// ============================================================
+// BACKUP AUTOMATICO SEMANAL (16/07/2026): todo domingo as 3h (SP)
+// grava uma copia do blob 'main' (id backup_main_AAAA-MM-DD) e de
+// todos os pacientes (id backup_patients_AAAA-MM-DD) na propria
+// tabela clinic_data. Mantem as 4 copias mais recentes de cada tipo
+// (~1 mes de historico). O app nunca le nem grava esses registros.
+// Manual: GET /api/backup?key=SUA_KEY
+// ============================================================
+async function _upsertRegistro(id, dataObj) {
+  var rs = await fetch(SUPA_URL + "/rest/v1/clinic_data?on_conflict=id", {
+    method: "POST",
+    headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY, "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal" },
+    body: JSON.stringify({ id: id, data: dataObj, updated_at: new Date().toISOString() })
+  });
+  if (!rs.ok) console.error('[backup] upsert falhou:', id, rs.status);
+  return rs.ok;
+}
+
+async function _limparBackupsAntigos(prefixo, manter) {
+  try {
+    var r = await fetch(SUPA_URL + "/rest/v1/clinic_data?select=id&id=like." + encodeURIComponent(prefixo + '*'), {
+      headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY }
+    });
+    if (!r.ok) return;
+    var rows = await r.json();
+    var ids = (rows || []).map(function (x) { return x.id; }).sort().reverse(); // mais recentes primeiro (data no nome)
+    var apagar = ids.slice(manter);
+    for (var i = 0; i < apagar.length; i++) {
+      await fetch(SUPA_URL + "/rest/v1/clinic_data?id=eq." + encodeURIComponent(apagar[i]), {
+        method: "DELETE",
+        headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY, "Prefer": "return=minimal" }
+      });
+      console.log('[backup] removido backup antigo:', apagar[i]);
+    }
+  } catch (e) { console.error('[backup] limpeza erro:', e); }
+}
+
+async function rodarBackup() {
+  try {
+    var t = _spDateStr(0);
+    var okMain = false, okPats = false, qtdPats = 0;
+    // 1) blob principal (agenda, financeiro, planos, config, tudo)
+    var data = await _lerClinicData();
+    if (data) okMain = await _upsertRegistro('backup_main_' + t, data);
+    // 2) todos os pacientes (tabela patients)
+    var pac = await _carregarPacientes();
+    if (pac && pac.lista && pac.lista.length) {
+      qtdPats = pac.lista.length;
+      okPats = await _upsertRegistro('backup_patients_' + t, { pacientes: pac.lista.map(function (r) { return r.p; }), total: qtdPats, geradoEm: new Date().toISOString() });
+    }
+    // 3) mantem so as 4 copias mais recentes de cada tipo
+    await _limparBackupsAntigos('backup_main_', 4);
+    await _limparBackupsAntigos('backup_patients_', 4);
+    console.log('[backup] concluido ' + t + ' | main: ' + (okMain ? 'OK' : 'FALHOU') + ' | pacientes(' + qtdPats + '): ' + (okPats ? 'OK' : 'FALHOU'));
+    return { ok: okMain && okPats, data: t, blobPrincipal: okMain, pacientes: qtdPats, pacientesOk: okPats };
+  } catch (e) { console.error('[backup] erro:', e); return { ok: false, error: String(e && e.message) }; }
+}
+
+// Agendador do backup: todo domingo as 3h da manha (SP)
+cron.schedule('0 3 * * 0', function () {
+  console.log('[backup] iniciando backup semanal...');
+  rodarBackup();
+}, { timezone: 'America/Sao_Paulo' });
+
+// Backup manual (protegido pela DISPARO_KEY): GET /api/backup?key=SUA_KEY
+app.get('/api/backup', async (req, res) => {
+  try {
+    if ((req.query.key || '') !== DISPARO_KEY) return res.status(403).json({ ok: false, error: 'key invalida' });
+    var out = await rodarBackup();
+    return res.json(out);
+  } catch (e) { return res.status(500).json({ ok: false, error: String(e && e.message) }); }
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
