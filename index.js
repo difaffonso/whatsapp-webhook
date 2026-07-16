@@ -801,6 +801,7 @@ function _montarFila(data, pacientes, t, tm, y) {
   //   - janela de 3 a 30 dias (nao resgata planos antigos parados)
   //   - 1 envio por plano (chave ot_) E no maximo 1 mensagem de orcamento por
   //     paciente (chave op_, trava por ~120 dias) mesmo que tenha varios planos
+  //   - paciente com consulta futura marcada NAO recebe (ja deu sequencia)
   //   - teto diario proprio: WA_MAX_ORCAMENTO (padrao 20)
   // Dedup identico aos demais tipos: blob + copia do servidor (wa_sent_srv).
   if (cfg.orcamento) {
@@ -819,6 +820,12 @@ function _montarFila(data, pacientes, t, tm, y) {
       if (!(dias >= 3 && dias <= 30)) return;
       var p = pacientes.porId[Number(tr.patientId)]; if (!p || !p.phone) return;
       var pid = (p.id != null) ? p.id : Number(tr.patientId);
+      // paciente que JA esta agendado nao recebe (16/07/2026): se marcou consulta,
+      // o contato de "dar sequencia" fica sem sentido e soa mal
+      var temFutura = appts.find(function (a) {
+        return (Number(a.patientId) === Number(tr.patientId) || Number(a.patientId) === Number(pid)) && !a.blocked && a.date >= t && a.status !== 'cancelled' && a.status !== 'missed';
+      });
+      if (temFutura) return;
       if (sent['op_' + pid] || orcNaRodada[pid]) return; // 1 por paciente
       if (orcCont >= WA_MAX_ORCAMENTO) return; // teto diario proprio
       var d = dOf(tr.dentistId);
