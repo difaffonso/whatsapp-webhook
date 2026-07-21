@@ -661,7 +661,7 @@ function _diasEntre(aYmd, bYmd) { return Math.floor((new Date(aYmd + 'T12:00:00Z
 function _normFone(fone) { var to = soDigitos(fone); if (to.length === 11 || to.length === 10) to = '55' + to; return to; }
 
 // procedimentos considerados cirúrgicos (mesma lista do app)
-var PCIR_WA = ["extra", "exodont", "cirurg", "implante", "enxerto", "sinus", "frenectomia", "apicectomia", "biopsia", "gengivo"];
+var PCIR_WA = ["exo", "extra", "exodont", "cirurg", "implante", "enxerto", "sinus", "frenectomia", "apicectomia", "biopsia", "gengivo"];
 
 async function _lerClinicData() {
   var r = await fetch(SUPA_URL + "/rest/v1/clinic_data?id=eq.main&select=data", {
