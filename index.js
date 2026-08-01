@@ -663,6 +663,21 @@ function _normFone(fone) { var to = soDigitos(fone); if (to.length === 11 || to.
 // procedimentos considerados cirúrgicos (mesma lista do app)
 var PCIR_WA = ["exo", "extra", "exodont", "cirurg", "implante", "enxerto", "sinus", "frenectomia", "apicectomia", "biopsia", "gengivo"];
 
+// V263 - deteccao de procedimento cirurgico (mesma regra do app)
+// POS: palavra que ativa. NEG: palavra que bloqueia (tem prioridade).
+// "implante" so conta quando o nome COMECA com implante (evita "protese sobre implante").
+var PCIR_POS = ["exo", "cirurg", "enxert", "sinus", "seio", "frenectomia", "apicect", "biopsia", "gengivo", "cisto", "sisto", "reabertura", "siso", "urgenc"];
+var PCIR_NEG = ["avaliac", "avaliar", "controle", "coroa", "protese", "finalizac", "fixac", "mole"];
+function _normCir(s) { return String(s || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, ""); }
+function ehCirurgia(proc) {
+  var n = _normCir(proc).trim();
+  if (!n) return false;
+  for (var i = 0; i < PCIR_NEG.length; i++) { if (n.indexOf(PCIR_NEG[i]) >= 0) return false; }
+  if (n.indexOf("implante") === 0) return true;
+  for (var j = 0; j < PCIR_POS.length; j++) { if (n.indexOf(PCIR_POS[j]) >= 0) return true; }
+  return false;
+}
+
 async function _lerClinicData() {
   var r = await fetch(SUPA_URL + "/rest/v1/clinic_data?id=eq.main&select=data", {
     headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY }
@@ -767,7 +782,7 @@ function _montarFila(data, pacientes, t, tm, y) {
       if (a.status !== 'done' && a.status !== 'confirmed') return;
       var p = pacientes.porId[Number(a.patientId)]; if (!p || !p.phone) return;
       var pid = (p.id != null) ? p.id : Number(a.patientId);
-      var isCir = PCIR_WA.some(function (w) { return (a.procedure || '').toLowerCase().indexOf(w) >= 0; });
+      var isCir = ehCirurgia(a.procedure);
       var d = dOf(a.dentistId);
       if (isCir && cfg.poscirurgia) {
         addJob("Pós-cirurgia", "pc_" + a.id, "pos__procedimento_", p.phone, [p.name, d.name, a.procedure || 'procedimento'], p.name);
