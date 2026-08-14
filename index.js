@@ -1110,24 +1110,30 @@ async function _limparBackupsAntigos(prefixo, manter) {
   } catch (e) { console.error('[backup] limpeza erro:', e); }
 }
 
+// 14/08/2026: o backup passou a ser montado DENTRO do Postgres, pela funcao
+// rodar_backup_semanal(). Antes o servidor baixava os ~10.400 pacientes e
+// devolvia ~9 MB pela internet num unico POST -- isso estourava o
+// statement_timeout de 8s da API sempre que a maquina estava ocupada
+// (funcionava as 3h de domingo por sorte, com o banco parado, e falhava em
+// qualquer teste em horario comercial). Agora os dados nunca saem do banco:
+// leva menos de 1 segundo e nao depende do movimento da clinica.
+// A funcao faz as tres etapas: grava o blob principal, grava os pacientes e
+// mantem as 4 copias mais recentes de cada tipo.
 async function rodarBackup() {
   try {
-    var t = _spDateStr(0);
-    var okMain = false, okPats = false, qtdPats = 0;
-    // 1) blob principal (agenda, financeiro, planos, config, tudo)
-    var data = await _lerClinicData();
-    if (data) okMain = await _upsertRegistro('backup_main_' + t, data);
-    // 2) todos os pacientes (tabela patients)
-    var pac = await _carregarPacientes();
-    if (pac && pac.lista && pac.lista.length) {
-      qtdPats = pac.lista.length;
-      okPats = await _upsertRegistro('backup_patients_' + t, { pacientes: pac.lista.map(function (r) { return r.p; }), total: qtdPats, geradoEm: new Date().toISOString() });
+    var rs = await fetch(SUPA_URL + "/rest/v1/rpc/rodar_backup_semanal", {
+      method: "POST",
+      headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY, "Content-Type": "application/json" },
+      body: "{}"
+    });
+    if (!rs.ok) {
+      var txt = await rs.text();
+      console.error('[backup] rpc falhou:', rs.status, txt);
+      return { ok: false, error: 'rpc ' + rs.status + ': ' + txt };
     }
-    // 3) mantem so as 4 copias mais recentes de cada tipo
-    await _limparBackupsAntigos('backup_main_', 4);
-    await _limparBackupsAntigos('backup_patients_', 4);
-    console.log('[backup] concluido ' + t + ' | main: ' + (okMain ? 'OK' : 'FALHOU') + ' | pacientes(' + qtdPats + '): ' + (okPats ? 'OK' : 'FALHOU'));
-    return { ok: okMain && okPats, data: t, blobPrincipal: okMain, pacientes: qtdPats, pacientesOk: okPats };
+    var out = await rs.json();
+    console.log('[backup] concluido ' + (out && out.data) + ' | main: ' + ((out && out.blobPrincipal) ? 'OK' : 'FALHOU') + ' | pacientes(' + (out && out.pacientes) + '): ' + ((out && out.pacientesOk) ? 'OK' : 'FALHOU'));
+    return out;
   } catch (e) { console.error('[backup] erro:', e); return { ok: false, error: String(e && e.message) }; }
 }
 
