@@ -1074,12 +1074,15 @@ _atualizarCachePacientes();
 // BACKUP AUTOMATICO SEMANAL (16/07/2026): todo domingo as 3h (SP)
 // grava uma copia do blob 'main' (id backup_main_AAAA-MM-DD) e de
 // todos os pacientes (id backup_patients_AAAA-MM-DD) na propria
-// tabela clinic_data. Mantem as 4 copias mais recentes de cada tipo
+// tabela clinic_backups (13/08/2026: movido para fora da clinic_data,
+// que e gravada ~1.500x/dia -- as copias de 17MB dentro dela faziam o
+// autovacuum varrer 24MB o dia inteiro e estouravam o Disk IO Budget).
+// Mantem as 4 copias mais recentes de cada tipo
 // (~1 mes de historico). O app nunca le nem grava esses registros.
 // Manual: GET /api/backup?key=SUA_KEY
 // ============================================================
 async function _upsertRegistro(id, dataObj) {
-  var rs = await fetch(SUPA_URL + "/rest/v1/clinic_data?on_conflict=id", {
+  var rs = await fetch(SUPA_URL + "/rest/v1/clinic_backups?on_conflict=id", {
     method: "POST",
     headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY, "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal" },
     body: JSON.stringify({ id: id, data: dataObj, updated_at: new Date().toISOString() })
@@ -1090,7 +1093,7 @@ async function _upsertRegistro(id, dataObj) {
 
 async function _limparBackupsAntigos(prefixo, manter) {
   try {
-    var r = await fetch(SUPA_URL + "/rest/v1/clinic_data?select=id&id=like." + encodeURIComponent(prefixo + '*'), {
+    var r = await fetch(SUPA_URL + "/rest/v1/clinic_backups?select=id&id=like." + encodeURIComponent(prefixo + '*'), {
       headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY }
     });
     if (!r.ok) return;
@@ -1098,7 +1101,7 @@ async function _limparBackupsAntigos(prefixo, manter) {
     var ids = (rows || []).map(function (x) { return x.id; }).sort().reverse(); // mais recentes primeiro (data no nome)
     var apagar = ids.slice(manter);
     for (var i = 0; i < apagar.length; i++) {
-      await fetch(SUPA_URL + "/rest/v1/clinic_data?id=eq." + encodeURIComponent(apagar[i]), {
+      await fetch(SUPA_URL + "/rest/v1/clinic_backups?id=eq." + encodeURIComponent(apagar[i]), {
         method: "DELETE",
         headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY, "Prefer": "return=minimal" }
       });
