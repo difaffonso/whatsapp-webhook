@@ -568,13 +568,11 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
         const idadeMsg = agora - msgTimestamp;
         if (idadeMsg > 120000) return res.status(200).json({ status: 'ok' });
         const texto = msg.text?.body?.trim() || '';
-        // ===== Confirmacao (SIM/NAO/1/2) — resposta digitada ao lembrete =====
-        const nomePerfilTxt = value?.contacts?.[0]?.profile?.name || '';
-        const tratadoTxt = await processarRespostaConfirmacao(from, texto, nomePerfilTxt);
-        if (tratadoTxt) {
-          ultimoEnvio[from] = agora;
-          return res.status(200).json({ status: 'ok' });
-        }
+        // ===== REGRA (24/09/2026): texto digitado NUNCA muda status de consulta =====
+        // Confirmar/Desmarcar so vale pelos BOTOES do template (bloco tipo === 'button').
+        // Motivo: "Nao tem que tomar nada antes?" foi lido como NAO e cancelou
+        // a consulta ja confirmada da paciente Maria Parente Oliveira.
+        // O texto continua salvo em Conversas (salvarMensagem acima) para a equipe responder.
         const opcaoMenu = ['1','2','3','4','5'].includes(texto);
         if (!opcaoMenu) {
           const ultimoTempo = ultimoEnvio[from] || 0;
