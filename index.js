@@ -35,24 +35,32 @@ function mensagemJaProcessada(id) {
 }
 
 // Busca paciente(s) na TABELA patients (separada do clinic_data) pelo telefone.
-// Retorna { nome, ids:[...] } ou null. Coleta TODOS os ids possiveis (id do registro E id interno,
+// Retorna { nome, ids:[...], nomes:{id:nome} } ou null. Coleta TODOS os ids possiveis (id do registro E id interno,
 // sempre como numero) para casar com appts mesmo havendo cadastro duplicado ou tipo diferente (string x numero).
+// 02/10/2026: o mesmo celular pode ser de mais de um paciente (casal, mae e filho...). "nomes" guarda o nome de
+// CADA id para saber a qual deles o lembrete respondido pertence. Baixa so nome/telefone/id (antes vinha o
+// cadastro inteiro, com assinaturas da anamnese: ~10 MB a cada toque no botao).
 async function buscarPacientePorTelefone(telefone) {
   try {
-    var achados = [], nome = '';
+    var achados = [], nome = '', nomes = {};
     var lastId = 0, step = 1000;
+    var sel = "id,name:data->>name,phone:data->>phone,did:data->>id";
     for (var guard = 0; guard < 500; guard++) {
-      var r = await fetch(SUPA_URL + "/rest/v1/patients?select=id,data&order=id.asc&limit=" + step + "&id=gt." + lastId, {
+      var r = await fetch(SUPA_URL + "/rest/v1/patients?select=" + sel + "&order=id.asc&limit=" + step + "&id=gt." + lastId, {
         headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY }
       });
+      if (!r.ok && lastId === 0 && sel !== "id,data") { sel = "id,data"; guard--; continue; } // reserva: formato antigo
       if (!r.ok) break;
       var rows = await r.json();
       if (!rows || !rows.length) break;
       for (var k = 0; k < rows.length; k++) {
-        var pd = rows[k].data;
+        var row = rows[k];
+        var pd = row.data || { name: row.name, phone: row.phone, id: row.did };
         if (pd && mesmoTelefone(pd.phone, telefone)) {
-          if (rows[k].id != null) achados.push(Number(rows[k].id));
-          if (pd.id != null) achados.push(Number(pd.id));
+          var idsRow = [];
+          if (row.id != null) idsRow.push(Number(row.id));
+          if (pd.id != null && pd.id !== '') idsRow.push(Number(pd.id));
+          idsRow.forEach(function (v) { if (!isNaN(v)) { achados.push(v); nomes[v] = pd.name || ''; } });
           if (!nome) nome = pd.name || '';
         }
       }
@@ -61,11 +69,105 @@ async function buscarPacientePorTelefone(telefone) {
     }
     if (!achados.length) return null;
     var ids = achados.filter(function (v, i, a) { return !isNaN(v) && a.indexOf(v) === i; });
-    return { nome: nome, ids: ids };
+    return { nome: nome, ids: ids, nomes: nomes };
   } catch (e) {
     console.error('buscarPacientePorTelefone erro:', e);
     return null;
   }
+}
+
+// ============================================================
+// QUAL CONSULTA O BOTAO RESPONDE (correcao 02/10/2026)
+// Caso real: Elias e Priscila Gasques usam o MESMO celular e tinham
+// consultas no mesmo dia (13h e 14h). Cada um tocou "Confirmar" no seu
+// lembrete, mas o servidor so olhava o telefone: o 1o toque confirmava a
+// 1a consulta da lista e o 2o caia DE NOVO nela (ja confirmada) -> a outra
+// ficava pendente. Aconteceu em 04/09, 17/09, 25/09 e 02/10.
+// Agora: o botao chega com context.id = wamid do lembrete respondido; o
+// envio desse lembrete esta salvo em wa_messages com o texto
+// "... · 02/10/2026 · 13:00 · ...", entao sabemos o DIA e o HORARIO exatos.
+// Sem lembrete identificado, a de amanha que ainda NAO esta no status
+// pedido vem primeiro (o 2o toque confirma a outra consulta).
+// ============================================================
+function _hhmm(t) {
+  var m = String(t || '').match(/(\d{1,2}):(\d{2})/);
+  return m ? ((m[1].length < 2 ? '0' : '') + m[1] + ':' + m[2]) : '';
+}
+function _normNome(s) {
+  return String(s || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+// Extrai dia (AAAA-MM-DD) e horario (HH:MM) do texto salvo do lembrete.
+function _refDoTexto(body) {
+  var s = String(body || '');
+  var out = { date: null, time: null };
+  var d = s.match(/(\d{2})\/(\d{2})\/(\d{4})/);
+  if (!d) return out;
+  out.date = d[3] + '-' + d[2] + '-' + d[1];
+  var h = s.slice(d.index + d[0].length).match(/(^|[^\d])(\d{1,2}):(\d{2})(?!\d)/); // horario DEPOIS da data
+  if (h) out.time = _hhmm(h[2] + ':' + h[3]);
+  return out;
+}
+// Le o lembrete que o paciente respondeu (pelo wamid do context do botao).
+async function _lerLembreteRespondido(contextId) {
+  if (!contextId) return null;
+  try {
+    var r = await fetch(SUPA_URL + "/rest/v1/wa_messages?select=body,patient_name,patient_id&wamid=eq." + encodeURIComponent(contextId) + "&limit=1", {
+      headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY }
+    });
+    if (!r.ok) return null;
+    var rows = await r.json();
+    var m = rows && rows[0];
+    if (!m) return null;
+    var ref = _refDoTexto(m.body);
+    ref.nome = m.patient_name || '';
+    ref.pid = (m.patient_id != null && m.patient_id !== '') ? Number(m.patient_id) : null;
+    return ref;
+  } catch (e) {
+    console.error('_lerLembreteRespondido erro:', e);
+    return null;
+  }
+}
+// ids (do mesmo telefone) do paciente a quem o lembrete foi enviado
+function _idsDoLembrete(ref, idSet, nomesPorId) {
+  var out = {};
+  if (!ref) return out;
+  if (ref.pid != null && !isNaN(ref.pid) && idSet[ref.pid]) out[ref.pid] = true;
+  var nr = _normNome(ref.nome);
+  if (nr && nomesPorId) Object.keys(nomesPorId).forEach(function (id) { if (_normNome(nomesPorId[id]) === nr) out[Number(id)] = true; });
+  return out;
+}
+// Escolhe a consulta. o = { idSet, nomesPorId, novoStatus, ref, hoje, amanha }
+function _escolherConsulta(appts, o) {
+  var candidatas = (appts || []).filter(function (a) {
+    return a && o.idSet[Number(a.patientId)] && (a.status === 'pending' || a.status === 'confirmed');
+  });
+  var porHorario = function (lista) {
+    return lista.slice().sort(function (a, b) { return (String(a.date) + ' ' + _hhmm(a.time)).localeCompare(String(b.date) + ' ' + _hhmm(b.time)); });
+  };
+  var aindaNao = function (lista) { // as que ainda nao estao no status pedido vem primeiro
+    var x = lista.filter(function (a) { return a.status !== o.novoStatus; });
+    return x.length ? x : lista;
+  };
+  var ref = o.ref;
+  var refIds = _idsDoLembrete(ref, o.idSet, o.nomesPorId);
+  var temRefIds = Object.keys(refIds).length > 0;
+  // 1) pelo lembrete respondido: mesmo dia e horario
+  if (ref && ref.date) {
+    var exatas = candidatas.filter(function (a) { return a.date === ref.date && (!ref.time || _hhmm(a.time) === ref.time); });
+    if (exatas.length > 1 && temRefIds) {
+      var doPac = exatas.filter(function (a) { return refIds[Number(a.patientId)]; });
+      if (doPac.length) exatas = doPac;
+    }
+    if (exatas.length) return { alvo: porHorario(aindaNao(exatas))[0], via: 'lembrete', total: candidatas.length };
+  }
+  // 2) lembrete nao bate (consulta mudou de horario) ou nao identificado.
+  //    Se sabemos de QUEM era o lembrete, so vale consulta dessa pessoa (nunca a do familiar).
+  var base = temRefIds ? candidatas.filter(function (a) { return refIds[Number(a.patientId)]; }) : candidatas;
+  var amanha = base.filter(function (a) { return a.date === o.amanha; });
+  if (amanha.length) return { alvo: porHorario(aindaNao(amanha))[0], via: 'amanha', total: candidatas.length };
+  var futuras = base.filter(function (a) { return a.date >= o.hoje; });
+  if (futuras.length) return { alvo: porHorario(futuras)[0], via: 'proxima', total: candidatas.length };
+  return { alvo: null, via: '', total: candidatas.length };
 }
 
 // ============================================================
@@ -85,114 +187,281 @@ function _bumpVers(dataObj, chaves) {
 }
 
 // Monta o patch de status (carimbo _ts NOVO a cada chamada: vence o merge do app)
-function montarPatchStatus(novoStatus) {  var patch = { status: novoStatus };
+// quandoMs (opcional): hora ORIGINAL da resposta do paciente — usada quando a guarda
+// reaplica, para a agenda continuar mostrando a hora em que ele respondeu.
+function montarPatchStatus(novoStatus, quandoMs) {  var patch = { status: novoStatus };
   patch._ts = Date.now(); // carimbo anti-overwrite: sem isso o app aberto reverte o status no proximo save/merge
+  var quandoIso = new Date(quandoMs || Date.now()).toISOString();
   if (novoStatus === 'cancelled') {
     patch.canceladoWA = true;
-    patch.canceladoWAts = new Date().toISOString();
+    patch.canceladoWAts = quandoIso;
     patch.motivoCancel = 'Cancelou pelo WhatsApp';
     patch.noRebook = false;
     patch.waCancelVisto = false;
   }
   if (novoStatus === 'confirmed') {
     patch.confirmadoWA = true;
-    patch.confirmadoWAts = new Date().toISOString();
+    patch.confirmadoWAts = quandoIso;
   }
   return patch;
 }
 
 // ============================================================
-// VIGIA DE STATUS (correcao 14/07/2026): o app aberto na clinica salva
-// o blob INTEIRO a cada alteracao. Se esse save acontecer na janela de
-// segundos em que o servidor gravou a confirmacao/cancelamento do
-// paciente (antes de o app ter puxado a mudanca no poll), o save do app
-// REVERTE o status. Solucao: apos gravar, o servidor confere de novo
-// aos 15s, 40s e 90s e REAPLICA se foi revertido — com _ts novo, que
-// vence o merge do app. Reaplica SOMENTE se o status atual for
-// pending/confirmed (estado pre-resposta): nunca briga com uma mudanca
-// feita de proposito por um usuario na agenda (done, missed etc.).
+// FILA DO BLOB (02/10/2026): toda leitura+gravacao do blob 'main' feita
+// pelo servidor passa por aqui, UMA DE CADA VEZ. Dois toques em
+// "Confirmar" com 3s de diferenca (mesmo celular, duas consultas) podiam
+// ler o blob ao mesmo tempo, e a 2a gravacao apagava a 1a.
 // ============================================================
-function _vigiarStatus(apptId, novoStatus) {
-  var esperas = [15000, 40000, 90000];
-  var passo = function (i) {
-    if (i >= esperas.length) return;
-    setTimeout(async function () {
-      try {
-        var data = await _lerClinicData();
-        if (!data) return passo(i + 1);
-        var appts = data.appts || [];
-        var a = appts.find(function (x) { return x && x.id === apptId; });
-        if (!a) return; // consulta removida: nao insiste
-        if (a.status === novoStatus) return passo(i + 1); // ok, segue vigiando
-        // revertido pelo app? so reaplica se voltou ao estado pre-resposta
-        if (a.status !== 'pending' && a.status !== 'confirmed') return; // mudanca humana: respeita
-        var novoAppts = appts.map(function (x) {
-          if (!x || x.id !== apptId) return x;
-          return Object.assign({}, x, montarPatchStatus(novoStatus));
-        });
-        var novoData = _bumpVers(Object.assign({}, data, { appts: novoAppts }), ['appts']); // carimba: app baixa a mudanca no proximo poll
-        var rs = await fetch(SUPA_URL + "/rest/v1/clinic_data?id=eq.main", {
-          method: "PATCH",
-          headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY, "Content-Type": "application/json", "Prefer": "return=minimal" },
-          body: JSON.stringify({ data: novoData, updated_at: new Date().toISOString() })
-        });
-        console.log('[vigia] status da consulta ' + apptId + ' foi revertido pelo app; reaplicado "' + novoStatus + '" (tentativa ' + (i + 1) + '): ' + (rs.ok ? 'OK' : 'FALHOU'));
-        passo(i + 1);
-      } catch (e) { console.error('[vigia] erro:', e); passo(i + 1); }
-    }, esperas[i]);
-  };
-  passo(0);
+var _filaBlob = Promise.resolve();
+function _naFila(fn) {
+  var p = _filaBlob.then(function () { return fn(); }, function () { return fn(); });
+  _filaBlob = p.then(function () {}, function () {});
+  return p;
 }
 
-// Atualiza status da consulta de amanha (ou a mais proxima futura) do paciente
-async function atualizarStatusConsulta(telefone, novoStatus) {
+async function _gravarBlobMain(novoData) {
+  return fetch(SUPA_URL + "/rest/v1/clinic_data?id=eq.main", {
+    method: "PATCH",
+    headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY, "Content-Type": "application/json", "Prefer": "return=minimal" },
+    body: JSON.stringify({ data: novoData, updated_at: new Date().toISOString() })
+  });
+}
+
+// ============================================================
+// GUARDA DAS RESPOSTAS DO WHATSAPP (02/10/2026)
+// Caso real: Elias Gasques tocou "Confirmar" em 01/10 as 19:20; o servidor
+// gravou "confirmada" e a vigia (15s/40s/90s) conferiu que estava certo.
+// Minutos depois, um aparelho com a agenda VELHA na memoria salvou o blob
+// inteiro e a consulta voltou para "pendente" -- e ninguem mais olhava.
+// Agora o servidor guarda cada confirmacao/cancelamento feito pelo
+// WhatsApp num registro proprio (clinic_data id='wa_conf_srv', que o app
+// nunca grava) e confere A CADA 2 MINUTOS, ate o dia da consulta passar.
+// Reaplica SOMENTE quando e claramente copia velha:
+//   - a consulta continua no mesmo dia e horario que o paciente respondeu;
+//   - o status voltou para o de antes da resposta (pendente; no
+//     cancelamento, pendente ou confirmada);
+//   - ninguem mudou o status na agenda depois da resposta (o app carimba
+//     statusTs sempre que alguem troca o status).
+// Mudanca feita de proposito na agenda (atendido, faltou, desmarcado,
+// voltou para pendente, remarcado...) sempre vence e encerra a guarda.
+// ============================================================
+var WA_GUARDA_ID = 'wa_conf_srv';
+var WA_GUARDA_MAX = 30;          // teto de reaplicacoes por consulta (trava de seguranca)
+var _guarda = {};                 // apptId -> { st, ts, date, time, n }
+var _guardaCarregada = false;
+var _guardaMudou = false;
+var _guardaRodando = false, _guardaDeNovo = false;
+var _guardaAvisouRpc = false;
+
+// 'ok' (segue vigiando) | 'reaplicar' | 'encerrar'
+function _avaliarGuarda(a, g, hoje) {
+  if (!g || !a) return 'encerrar';                                        // consulta apagada
+  if ((g.date || '') < hoje) return 'encerrar';                           // ja passou
+  if (g.date && a.date !== g.date) return 'encerrar';                     // remarcada para outro dia
+  if (g.time && _hhmm(a.time) !== _hhmm(g.time)) return 'encerrar';       // ou outro horario
+  if (a.status === g.st) return 'ok';
+  var preResposta = g.st === 'cancelled' ? (a.status === 'pending' || a.status === 'confirmed') : (a.status === 'pending');
+  if (!preResposta) return 'encerrar';                                    // atendido, faltou, remarcado...: decisao da equipe
+  var sTs = a.statusTs ? Date.parse(a.statusTs) : 0;
+  if (sTs && sTs > (g.ts || 0) - 120000) return 'encerrar';               // alguem da equipe trocou o status depois da resposta (2 min de folga p/ relogio do aparelho)
+  return 'reaplicar';                                                     // status de antes da resposta sem ninguem ter mexido: copia velha
+}
+
+function _registrarGuarda(a, st, ts) {
+  if (!a || a.id == null) return;
+  _guarda[String(a.id)] = { st: st, ts: ts || Date.now(), date: a.date || '', time: a.time || '', n: 0 };
+  _guardaMudou = true;
+}
+
+async function _salvarGuarda() {
+  if (!_guardaMudou) return true;
+  return _naFila(async function () { // na fila: duas gravacoes do registro nunca se cruzam
+    if (!_guardaMudou) return true;
+    _guardaMudou = false;
+    try {
+      var agora = new Date().toISOString();
+      var rs = await fetch(SUPA_URL + "/rest/v1/clinic_data?on_conflict=id", {
+        method: "POST",
+        headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY, "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal" },
+        body: JSON.stringify({ id: WA_GUARDA_ID, data: { itens: _guarda, atualizado: agora }, updated_at: agora })
+      });
+      if (!rs.ok) { _guardaMudou = true; console.error('[guarda] falha ao salvar registro:', rs.status); }
+      return rs.ok;
+    } catch (e) { _guardaMudou = true; console.error('[guarda] erro ao salvar registro:', e); return false; }
+  });
+}
+
+// Carrega o registro proprio e adota as respostas do WhatsApp que ja estao gravadas
+// nas consultas de hoje em diante (ex.: confirmadas antes desta versao subir).
+async function _carregarGuarda() {
+  if (_guardaCarregada) return true;
   try {
-    // 1) achar paciente pelo telefone (tabela patients, separada do clinic_data)
+    var h = { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY };
+    var r = await fetch(SUPA_URL + "/rest/v1/clinic_data?id=eq." + WA_GUARDA_ID + "&select=data", { headers: h });
+    if (!r.ok) return false;
+    var rows = await r.json();
+    var salvo = (rows && rows[0] && rows[0].data && rows[0].data.itens) || {};
+    Object.keys(salvo).forEach(function (k) { if (!_guarda[k]) _guarda[k] = salvo[k]; });
+    var r2 = await fetch(SUPA_URL + "/rest/v1/clinic_data?id=eq.main&select=appts:data->appts", { headers: h });
+    if (!r2.ok) return false;
+    var rows2 = await r2.json();
+    var hoje = _spDateStr(0), adotadas = 0;
+    ((rows2 && rows2[0] && rows2[0].appts) || []).forEach(function (a) {
+      if (!a || a.id == null || !a.date || a.date < hoje || _guarda[String(a.id)]) return;
+      var st = null, ts = 0;
+      if (a.status === 'confirmed' && a.confirmadoWA) { st = 'confirmed'; ts = Date.parse(a.confirmadoWAts); }
+      else if (a.status === 'cancelled' && a.canceladoWA) { st = 'cancelled'; ts = Date.parse(a.canceladoWAts); }
+      if (!st) return;
+      _registrarGuarda(a, st, ts || Date.now());
+      adotadas++;
+    });
+    _guardaCarregada = true;
+    console.log('[guarda] carregada: ' + Object.keys(_guarda).length + ' resposta(s) protegida(s)' + (adotadas ? (' (' + adotadas + ' adotada(s) da agenda)') : ''));
+    return true;
+  } catch (e) { console.error('[guarda] erro ao carregar:', e); return false; }
+}
+
+// Le SO o status das consultas protegidas (funcao wa_status_consultas no banco: alguns
+// bytes em vez de 1 MB). Reserva: baixa a lista de consultas e filtra aqui.
+async function _lerStatusConsultas(ids) {
+  var h = { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY };
+  var porId = {};
+  try {
+    var r = await fetch(SUPA_URL + "/rest/v1/rpc/wa_status_consultas", {
+      method: "POST",
+      headers: Object.assign({ "Content-Type": "application/json" }, h),
+      body: JSON.stringify({ p_ids: ids.map(String) })
+    });
+    if (r.ok) {
+      var out = await r.json();
+      // sem a linha 'main' visivel (ex.: chave sem permissao) a funcao devolve null: NAO concluir que as consultas sumiram
+      if (out && out.updated_at) {
+        ((out && out.appts) || []).forEach(function (a) { if (a && a.id != null) porId[String(a.id)] = a; });
+        return porId;
+      }
+    }
+    if (!_guardaAvisouRpc) { _guardaAvisouRpc = true; console.log('[guarda] funcao wa_status_consultas indisponivel (' + r.status + '); usando leitura das consultas'); }
+  } catch (e) { console.error('[guarda] rpc erro:', e); }
+  try {
+    var r2 = await fetch(SUPA_URL + "/rest/v1/clinic_data?id=eq.main&select=appts:data->appts", { headers: h });
+    if (!r2.ok) return null;
+    var rows = await r2.json();
+    if (!rows || !rows[0] || !Array.isArray(rows[0].appts)) return null;
+    var quero = {};
+    ids.forEach(function (i) { quero[String(i)] = true; });
+    (rows[0].appts || []).forEach(function (a) { if (a && a.id != null && quero[String(a.id)]) porId[String(a.id)] = a; });
+    return porId;
+  } catch (e) { console.error('[guarda] leitura erro:', e); return null; }
+}
+
+async function _reaplicarGuarda(ids, hoje, motivo) {
+  return _naFila(async function () {
+    var data = await _lerClinicData();
+    if (!data) return;
+    var quero = {};
+    ids.forEach(function (i) { quero[String(i)] = true; });
+    var feitos = [];
+    var novoAppts = (data.appts || []).map(function (a) {
+      if (!a || a.id == null || !quero[String(a.id)]) return a;
+      var g = _guarda[String(a.id)];
+      if (!g || (g.n || 0) >= WA_GUARDA_MAX) return a;
+      if (_avaliarGuarda(a, g, hoje) !== 'reaplicar') return a; // confere de novo no blob fresco
+      feitos.push({ a: a, g: g });
+      return Object.assign({}, a, montarPatchStatus(g.st, g.ts));
+    });
+    if (!feitos.length) return;
+    var novoData = _bumpVers(Object.assign({}, data, { appts: novoAppts }), ['appts']);
+    var rs = await _gravarBlobMain(novoData);
+    feitos.forEach(function (f) {
+      if (rs.ok) { f.g.n = (f.g.n || 0) + 1; _guardaMudou = true; }
+      console.log('[guarda] consulta ' + f.a.id + ' (' + f.a.date + ' ' + f.a.time + ') tinha voltado para "' + f.a.status + '" (copia velha de algum aparelho); reaplicado "' + f.g.st + '" [' + motivo + ', vez ' + (f.g.n || 0) + ']: ' + (rs.ok ? 'OK' : ('FALHOU ' + rs.status)));
+    });
+  });
+}
+
+async function _passoGuarda(motivo) {
+  if (!_guardaCarregada && !(await _carregarGuarda())) return;
+  var hoje = _spDateStr(0);
+  Object.keys(_guarda).forEach(function (id) { if ((_guarda[id].date || '') < hoje) { delete _guarda[id]; _guardaMudou = true; } });
+  var ids = Object.keys(_guarda);
+  if (ids.length) {
+    var atual = await _lerStatusConsultas(ids);
+    if (!atual) return;
+    var reaplicar = [];
+    ids.forEach(function (id) {
+      var g = _guarda[id];
+      if (!g) return;
+      if (!atual[id]) { // sumiu do blob: pode ser apagada de verdade OU copia velha sem ela -> so desiste na 3a conferencia seguida
+        g.sumida = (g.sumida || 0) + 1;
+        if (g.sumida >= 3) { delete _guarda[id]; _guardaMudou = true; }
+        return;
+      }
+      if (g.sumida) g.sumida = 0;
+      var acao = _avaliarGuarda(atual[id], g, hoje);
+      if (acao === 'encerrar') { delete _guarda[id]; _guardaMudou = true; }
+      else if (acao === 'reaplicar') reaplicar.push(id);
+    });
+    if (reaplicar.length) await _reaplicarGuarda(reaplicar, hoje, motivo);
+  }
+  await _salvarGuarda();
+}
+
+async function rodarGuarda(motivo) {
+  if (_guardaRodando) { _guardaDeNovo = true; return; }
+  _guardaRodando = true;
+  try {
+    do { _guardaDeNovo = false; await _passoGuarda(motivo || 'agendada'); } while (_guardaDeNovo);
+  } catch (e) { console.error('[guarda] erro:', e); }
+  finally { _guardaRodando = false; }
+}
+
+// VIGIA (14/07/2026, agora sobre a guarda): logo apos uma resposta, confere aos 15s, 55s e 145s
+// (janela em que o app aberto mais costuma salvar por cima); depois a guarda segue a cada 2 min.
+function _vigiarStatus() {
+  [15000, 55000, 145000].forEach(function (ms) {
+    setTimeout(function () { rodarGuarda('vigia ' + Math.round(ms / 1000) + 's'); }, ms);
+  });
+}
+
+// Atualiza o status da consulta que o paciente respondeu (ver _escolherConsulta).
+// contextId: wamid do lembrete respondido (vem no botao). Sem ele, cai na regra de amanha/proxima.
+async function atualizarStatusConsulta(telefone, novoStatus, contextId) {
+  try {
+    // 1) achar paciente(s) pelo telefone (tabela patients, separada do clinic_data)
     var pac = await buscarPacientePorTelefone(telefone);
     if (!pac || !pac.ids || !pac.ids.length) { console.log('[confirmacao] paciente nao encontrado para', telefone); return { ok: false, motivo: 'paciente nao encontrado' }; }
     var idSet = {};
     pac.ids.forEach(function (i) { idSet[Number(i)] = true; });
+    // 2) qual lembrete foi respondido (dia/horario/nome)
+    var ref = await _lerLembreteRespondido(contextId);
+    if (contextId) console.log('[confirmacao] ' + telefone + ' respondeu o lembrete ' + (ref ? (ref.date + ' ' + ref.time + ' ' + ref.nome) : '(nao achado em wa_messages)'));
 
-    // 2) carregar clinic_data (as consultas ficam aqui)
-    var r = await fetch(SUPA_URL + "/rest/v1/clinic_data?id=eq.main&select=data", {
-      headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY }
+    // 3) ler o blob, escolher a consulta e gravar -- na fila, uma resposta de cada vez
+    var res = await _naFila(async function () {
+      var data = await _lerClinicData();
+      if (!data) return { ok: false, motivo: 'sem dados' };
+      var appts = data.appts || [];
+      var esc = _escolherConsulta(appts, { idSet: idSet, nomesPorId: pac.nomes, novoStatus: novoStatus, ref: ref, hoje: _spDateStr(0), amanha: _spDateStr(1) });
+      var alvo = esc.alvo;
+      if (!alvo) { console.log('[confirmacao] consulta nao encontrada para', telefone, 'ids:', JSON.stringify(pac.ids), 'candidatas:', esc.total); return { ok: false, motivo: 'consulta nao encontrada', nome: pac.nome }; }
+      var patch = montarPatchStatus(novoStatus);
+      var novoAppts = appts.map(function (a) {
+        if (a.id !== alvo.id) return a;
+        return Object.assign({}, a, patch);
+      });
+      var novoData = _bumpVers(Object.assign({}, data, { appts: novoAppts }), ['appts']); // carimba: app baixa a mudanca no proximo poll
+      var rs = await _gravarBlobMain(novoData);
+      var nomeAlvo = (pac.nomes && pac.nomes[Number(alvo.patientId)]) || pac.nome;
+      if (!rs.ok) return { ok: false, motivo: 'falha ao salvar', nome: nomeAlvo };
+      console.log('[confirmacao] ' + novoStatus + ': ' + nomeAlvo + ' ' + alvo.date + ' ' + alvo.time + ' (consulta ' + alvo.id + ', via ' + esc.via + ')');
+      _registrarGuarda(alvo, novoStatus, patch._ts);
+      return { ok: true, nome: nomeAlvo, date: alvo.date, time: alvo.time, proc: alvo.procedure || '' };
     });
-    var rows = await r.json();
-    if (!rows || !rows[0] || !rows[0].data) return { ok: false, motivo: 'sem dados' };
-    var data = rows[0].data;
-    var appts = data.appts || [];
-
-    // 2) datas: amanha e hoje (fuso SP)
-    var sp = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Sao_Paulo" }));
-    var hojeStr = sp.toISOString().split('T')[0];
-    var amanhaD = new Date(sp); amanhaD.setDate(sp.getDate() + 1);
-    var amanhaStr = amanhaD.toISOString().split('T')[0];
-
-    // 3) achar consulta: prioridade amanha; senao a proxima futura nao finalizada.
-    //    Compara patientId com Number() nos dois lados (evita falha string x numero) e aceita qualquer id do paciente.
-    var candidatas = appts.filter(function (a) {
-      return idSet[Number(a.patientId)] && (a.status === 'pending' || a.status === 'confirmed');
-    });
-    var alvo = candidatas.find(function (a) { return a.date === amanhaStr; })
-      || candidatas.filter(function (a) { return a.date >= hojeStr; }).sort(function (a, b) { return a.date.localeCompare(b.date); })[0];
-    if (!alvo) { console.log('[confirmacao] consulta nao encontrada para', telefone, 'ids:', JSON.stringify(pac.ids), 'candidatas:', candidatas.length); return { ok: false, motivo: 'consulta nao encontrada', nome: pac.nome }; }
-
-    // 4) aplicar novo status
-    var novoAppts = appts.map(function (a) {
-      if (a.id !== alvo.id) return a;
-      return Object.assign({}, a, montarPatchStatus(novoStatus));
-    });
-    var novoData = _bumpVers(Object.assign({}, data, { appts: novoAppts }), ['appts']); // carimba: app baixa a mudanca no proximo poll
-
-    // 5) salvar de volta
-    var rs = await fetch(SUPA_URL + "/rest/v1/clinic_data?id=eq.main", {
-      method: "PATCH",
-      headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY, "Content-Type": "application/json", "Prefer": "return=minimal" },
-      body: JSON.stringify({ data: novoData, updated_at: new Date().toISOString() })
-    });
-    if (!rs.ok) return { ok: false, motivo: 'falha ao salvar', nome: pac.nome };
-    _vigiarStatus(alvo.id, novoStatus); // vigia em segundo plano: reaplica se o app sobrescrever
-    return { ok: true, nome: pac.nome, date: alvo.date, time: alvo.time, proc: alvo.procedure || '' };
+    if (res && res.ok) {
+      if (_guardaCarregada || await _carregarGuarda()) await _salvarGuarda(); // so grava o registro inteiro depois de te-lo lido
+      _vigiarStatus(); // confere de novo em segundo plano: reaplica se o app sobrescrever
+    }
+    return res;
   } catch (e) {
     console.error('atualizarStatusConsulta erro:', e);
     return { ok: false, motivo: 'erro: ' + (e && e.message) };
@@ -201,14 +470,15 @@ async function atualizarStatusConsulta(telefone, novoStatus) {
 
 
 // Processa resposta SIM/NAO — vale para texto digitado E para botao do template
-async function processarRespostaConfirmacao(from, textoResp, nomePerfil) {
+// contextId (02/10/2026): wamid do lembrete respondido -> confirma a consulta CERTA quando o celular e de mais de um paciente
+async function processarRespostaConfirmacao(from, textoResp, nomePerfil, contextId) {
   const norm = String(textoResp || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
   if (!norm) return false;
   const isSim = norm === '1' || norm === 's' || norm === 'sim' || norm.indexOf('sim') === 0 || norm.indexOf('confirm') >= 0;
   const isNao = norm === '2' || norm === 'n' || norm === 'nao' || norm.indexOf('nao') === 0 || norm.indexOf('desmarc') >= 0 || norm.indexOf('cancel') >= 0 || norm.indexOf('remarc') >= 0;
   if (!isSim && !isNao) return false;
   const novoStatus = isSim ? 'confirmed' : 'cancelled';
-  const res = await atualizarStatusConsulta(from, novoStatus);
+  const res = await atualizarStatusConsulta(from, novoStatus, contextId);
   // Se NAO existe consulta futura para este numero, nao trata como confirmacao
   // (ex.: paciente novo digitando 1/2 no menu) -> deixa o menu responder
   if (!res || (!res.ok && (res.motivo === 'consulta nao encontrada' || res.motivo === 'paciente nao encontrado'))) {
@@ -531,10 +801,12 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
         salvarMensagem('in', from, _txtIn, { status: 'received', wamid: msg.id || null, patient_name: _nomeIn });
         if (tipo === 'button') {
           const textoBtn = msg.button?.text || msg.button?.payload || 'agendar';
+          const ctxBtn = (msg.context && msg.context.id) || null; // 02/10/2026: wamid do lembrete em que o botao foi tocado
           const msgTimestampBtn = parseInt(msg.timestamp) * 1000;
           if (Date.now() - msgTimestampBtn > 120000) return res.status(200).json({ status: 'ok' });
           const nomePerfilBtn = value?.contacts?.[0]?.profile?.name || '';
-          const tratadoBtn = await processarRespostaConfirmacao(from, textoBtn, nomePerfilBtn);
+          console.log('[botao] ' + from + ' tocou "' + textoBtn + '" no lembrete ' + (ctxBtn || '(sem context)'));
+          const tratadoBtn = await processarRespostaConfirmacao(from, textoBtn, nomePerfilBtn, ctxBtn);
           if (tratadoBtn) {
             ultimoEnvio[from] = Date.now();
             return res.status(200).json({ status: 'ok' });
@@ -619,8 +891,9 @@ app.get('/api/diag', async (req, res) => {
       var idSet = {};
       pac.ids.forEach(function (i) { idSet[Number(i)] = true; });
       out.consultasDoPaciente = appts.filter(function (a) { return idSet[Number(a.patientId)]; })
-        .map(function (a) { return { id: a.id, date: a.date, time: a.time, status: a.status, patientId: a.patientId }; });
+        .map(function (a) { return { id: a.id, date: a.date, time: a.time, status: a.status, patientId: a.patientId, paciente: (pac.nomes && pac.nomes[Number(a.patientId)]) || undefined, guarda: _guarda[String(a.id)] || undefined }; });
     }
+    out.guardaTotal = Object.keys(_guarda).length; // respostas do WhatsApp protegidas contra copia velha (02/10/2026)
     return res.json(out);
   } catch (e) { return res.status(500).json({ ok: false, error: String(e && e.message) }); }
 });
@@ -870,21 +1143,20 @@ function _purgarWaSent(sent, t) {
 }
 
 // Grava SOMENTE waSent + waAutoLog, relendo o blob na hora (merge seguro, não sobrescreve o app).
+// 02/10/2026: na fila do blob (nao cruza com uma confirmacao que chegue no meio do lote das 12h).
 async function _gravarWa(waSentNovo, novosLogs, purgar) {
-  try {
-    var atual = await _lerClinicData();
-    if (!atual) return false;
-    var waSent = Object.assign({}, atual.waSent || {}, waSentNovo || {});
-    if (purgar) waSent = _purgarWaSent(waSent, _spDateStr(0));
-    var log = (novosLogs || []).concat(atual.waAutoLog || []).slice(0, 300);
-    var novoData = _bumpVers(Object.assign({}, atual, { waSent: waSent, waAutoLog: log }), ['waSent', 'waAutoLog']); // carimba: app baixa e nao apaga as marcacoes do servidor
-    var rs = await fetch(SUPA_URL + "/rest/v1/clinic_data?id=eq.main", {
-      method: "PATCH",
-      headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY, "Content-Type": "application/json", "Prefer": "return=minimal" },
-      body: JSON.stringify({ data: novoData, updated_at: new Date().toISOString() })
-    });
-    return rs.ok;
-  } catch (e) { console.error('_gravarWa erro:', e); return false; }
+  return _naFila(async function () {
+    try {
+      var atual = await _lerClinicData();
+      if (!atual) return false;
+      var waSent = Object.assign({}, atual.waSent || {}, waSentNovo || {});
+      if (purgar) waSent = _purgarWaSent(waSent, _spDateStr(0));
+      var log = (novosLogs || []).concat(atual.waAutoLog || []).slice(0, 300);
+      var novoData = _bumpVers(Object.assign({}, atual, { waSent: waSent, waAutoLog: log }), ['waSent', 'waAutoLog']); // carimba: app baixa e nao apaga as marcacoes do servidor
+      var rs = await _gravarBlobMain(novoData);
+      return rs.ok;
+    } catch (e) { console.error('_gravarWa erro:', e); return false; }
+  });
 }
 
 // ============================================================
@@ -1067,6 +1339,14 @@ cron.schedule('0 13-20 * * *', function () {
 
 // aquece o cache de pacientes ao subir o servidor (varreduras já funcionam antes do lote das 12h)
 _atualizarCachePacientes();
+
+// Guarda das respostas do WhatsApp (02/10/2026): confere a cada 2 minutos se alguma
+// confirmacao/cancelamento voltou para o estado anterior por copia velha de um aparelho.
+// Sem respostas protegidas, nao faz nenhuma leitura no banco.
+cron.schedule('*/2 * * * *', function () {
+  rodarGuarda('a cada 2 min');
+}, { timezone: 'America/Sao_Paulo' });
+setTimeout(function () { rodarGuarda('inicio do servidor'); }, 20000); // carrega o registro e adota as respostas ja gravadas
 
 // ============================================================
 // BACKUP AUTOMATICO SEMANAL (16/07/2026): todo domingo as 3h (SP)
