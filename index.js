@@ -1030,13 +1030,22 @@ function _montarFila(data, pacientes, t, tm, y) {
     });
   }
 
-  // 3) SEMESTRAL — 6 meses após último atend. pago, sem consulta futura
+  // 3) SEMESTRAL — 6 meses após a ÚLTIMA CONSULTA, sem consulta futura
+  // V361 (igual ao app): última consulta = data mais recente entre o último atendimento
+  // pago (recs) e a última consulta "Realizado" da agenda (até hoje). Antes contava só o
+  // pagamento, e quem paga adiantado (ex.: prótese) recebia a mensagem ~3 meses cedo.
+  // Só entra quem tem pelo menos 1 atendimento pago (mesma porta de antes).
   if (cfg.semestral) {
+    var _pago = {}, _ult = {};
+    var _put = function (pid, d, did) { var k = Number(pid); if (isNaN(k) || !d) return; if (!_ult[k] || String(d) > _ult[k].date) _ult[k] = { date: String(d), dentistId: did }; };
+    recs.forEach(function (r) { if (r && Number(r.paid) > 0 && r.patientId != null) { _pago[Number(r.patientId)] = true; _put(r.patientId, r.date, r.dentistId); } });
+    appts.forEach(function (a) { if (a && a.status === 'done' && !a.blocked && a.date && a.date <= t) _put(a.patientId, a.date, a.dentistId); });
     pacientes.lista.forEach(function (reg) {
       var p = reg.p; if (!p.phone) return;
       var idSet = {}; reg.ids.forEach(function (i) { idSet[i] = true; });
-      var last = recs.filter(function (r) { return idSet[Number(r.patientId)] && r.paid > 0; }).sort(function (a, b) { return String(b.date).localeCompare(String(a.date)); })[0];
-      if (!last) return;
+      var last = null, temPago = false;
+      reg.ids.forEach(function (i) { if (_pago[i]) temPago = true; if (_ult[i] && (!last || _ult[i].date > last.date)) last = _ult[i]; });
+      if (!temPago || !last) return;
       if (_retDue(p, last.date) > t) return;
       var fut = appts.find(function (a) { return idSet[Number(a.patientId)] && a.date >= t && a.status !== 'cancelled' && a.status !== 'missed'; });
       if (fut) return;
