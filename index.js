@@ -219,12 +219,64 @@ function _naFila(fn) {
   return p;
 }
 
-async function _gravarBlobMain(novoData) {
-  return fetch(SUPA_URL + "/rest/v1/clinic_data?id=eq.main", {
-    method: "PATCH",
-    headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY, "Content-Type": "application/json", "Prefer": "return=minimal" },
-    body: JSON.stringify({ data: novoData, updated_at: new Date().toISOString() })
+// ============================================================
+// TRAVA OTIMISTA DO BLOB (06/10/2026, junto com a V362 do app)
+// A fila acima so organiza as gravacoes DESTE servidor. Entre ler o blob e
+// grava-lo de volta, um aparelho pode ter gravado -- e o PATCH do blob inteiro
+// apagava o que ele mandou (caso real 06/10: a baixa de um gasto feita no
+// celular sumiu 0,06s depois, coberta pela copia de outro aparelho).
+// Agora a gravacao so acontece se o blob ainda estiver na versao lida
+// (updated_at igual). Se alguem gravou no meio, nada e gravado: rele o blob,
+// refaz a alteracao em cima do novo e tenta de novo.
+// ============================================================
+async function _lerClinicDataTs() {
+  var r = await fetch(SUPA_URL + "/rest/v1/clinic_data?id=eq.main&select=data,updated_at", {
+    headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY }
   });
+  if (!r.ok) return null;
+  var rows = await r.json();
+  if (!rows || !rows[0] || !rows[0].data || !rows[0].updated_at) return null;
+  return { data: rows[0].data, updated_at: rows[0].updated_at };
+}
+
+// {ok:true} gravou | {ok:false, conflito:true} alguem gravou depois da leitura | {ok:false, status}
+async function _gravarBlobMainSe(novoData, tsLido) {
+  if (!tsLido) return { ok: false, status: 'sem-carimbo' };
+  try {
+    var r = await fetch(SUPA_URL + "/rest/v1/clinic_data?id=eq.main&updated_at=eq." + encodeURIComponent(tsLido) + "&select=updated_at", {
+      method: "PATCH",
+      headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY, "Content-Type": "application/json", "Prefer": "return=representation" },
+      body: JSON.stringify({ data: novoData, updated_at: new Date().toISOString() })
+    });
+    if (!r.ok) return { ok: false, status: r.status };
+    var rows = null;
+    try { rows = await r.json(); } catch (e) { rows = null; }
+    if (Array.isArray(rows) && rows.length) return { ok: true, status: r.status };
+    if (Array.isArray(rows)) return { ok: false, conflito: true, status: r.status };
+    return { ok: false, status: r.status };
+  } catch (e) { return { ok: false, status: String((e && e.message) || e) }; }
+}
+
+// Le o blob, aplica `alterar(data, tentativa)` e grava com a trava. alterar devolve
+// { novoData, ... } para gravar, ou null/sem novoData para nao gravar nada.
+// Devolve o que alterar devolveu + { ok, conflitos, status }.
+async function _alterarBlobMain(alterar) {
+  var conflitos = 0, ultimo = null;
+  for (var tentativa = 1; tentativa <= 6; tentativa++) {
+    var lido = await _lerClinicDataTs();
+    if (!lido) return { ok: false, status: 'leitura falhou', conflitos: conflitos };
+    var plano = await alterar(lido.data, tentativa);
+    if (!plano || !plano.novoData) return Object.assign({ ok: false, nadaAGravar: true, conflitos: conflitos }, plano || {});
+    var rs = await _gravarBlobMainSe(plano.novoData, lido.updated_at);
+    ultimo = Object.assign({}, plano, { ok: rs.ok, status: rs.status, conflitos: conflitos });
+    if (rs.ok) return ultimo;
+    if (!rs.conflito) return ultimo;
+    conflitos++;
+    console.log('[blob] um aparelho gravou entre a leitura e a gravacao; relendo (tentativa ' + tentativa + ')');
+    await new Promise(function (res) { setTimeout(res, 200 * tentativa); });
+  }
+  if (ultimo) { ultimo.ok = false; ultimo.status = 'conflito persistente'; }
+  return ultimo || { ok: false, status: 'conflito persistente', conflitos: conflitos };
 }
 
 // ============================================================
@@ -356,22 +408,24 @@ async function _lerStatusConsultas(ids) {
 
 async function _reaplicarGuarda(ids, hoje, motivo) {
   return _naFila(async function () {
-    var data = await _lerClinicData();
-    if (!data) return;
     var quero = {};
     ids.forEach(function (i) { quero[String(i)] = true; });
     var feitos = [];
-    var novoAppts = (data.appts || []).map(function (a) {
-      if (!a || a.id == null || !quero[String(a.id)]) return a;
-      var g = _guarda[String(a.id)];
-      if (!g || (g.n || 0) >= WA_GUARDA_MAX) return a;
-      if (_avaliarGuarda(a, g, hoje) !== 'reaplicar') return a; // confere de novo no blob fresco
-      feitos.push({ a: a, g: g });
-      return Object.assign({}, a, montarPatchStatus(g.st, g.ts));
+    // 06/10/2026: le + altera + grava com a trava otimista (refaz em cima do blob novo se um aparelho gravar no meio)
+    var rs = await _alterarBlobMain(function (data) {
+      feitos = [];
+      var novoAppts = (data.appts || []).map(function (a) {
+        if (!a || a.id == null || !quero[String(a.id)]) return a;
+        var g = _guarda[String(a.id)];
+        if (!g || (g.n || 0) >= WA_GUARDA_MAX) return a;
+        if (_avaliarGuarda(a, g, hoje) !== 'reaplicar') return a; // confere de novo no blob fresco
+        feitos.push({ a: a, g: g });
+        return Object.assign({}, a, montarPatchStatus(g.st, g.ts));
+      });
+      if (!feitos.length) return null;
+      return { novoData: _bumpVers(Object.assign({}, data, { appts: novoAppts }), ['appts']) };
     });
     if (!feitos.length) return;
-    var novoData = _bumpVers(Object.assign({}, data, { appts: novoAppts }), ['appts']);
-    var rs = await _gravarBlobMain(novoData);
     feitos.forEach(function (f) {
       if (rs.ok) { f.g.n = (f.g.n || 0) + 1; _guardaMudou = true; }
       console.log('[guarda] consulta ' + f.a.id + ' (' + f.a.date + ' ' + f.a.time + ') tinha voltado para "' + f.a.status + '" (copia velha de algum aparelho); reaplicado "' + f.g.st + '" [' + motivo + ', vez ' + (f.g.n || 0) + ']: ' + (rs.ok ? 'OK' : ('FALHOU ' + rs.status)));
@@ -438,22 +492,25 @@ async function atualizarStatusConsulta(telefone, novoStatus, contextId) {
 
     // 3) ler o blob, escolher a consulta e gravar -- na fila, uma resposta de cada vez
     var res = await _naFila(async function () {
-      var data = await _lerClinicData();
-      if (!data) return { ok: false, motivo: 'sem dados' };
-      var appts = data.appts || [];
-      var esc = _escolherConsulta(appts, { idSet: idSet, nomesPorId: pac.nomes, novoStatus: novoStatus, ref: ref, hoje: _spDateStr(0), amanha: _spDateStr(1) });
-      var alvo = esc.alvo;
-      if (!alvo) { console.log('[confirmacao] consulta nao encontrada para', telefone, 'ids:', JSON.stringify(pac.ids), 'candidatas:', esc.total); return { ok: false, motivo: 'consulta nao encontrada', nome: pac.nome }; }
-      var patch = montarPatchStatus(novoStatus);
-      var novoAppts = appts.map(function (a) {
-        if (a.id !== alvo.id) return a;
-        return Object.assign({}, a, patch);
+      // 06/10/2026: le + altera + grava com a trava otimista (se um aparelho gravar no meio, refaz em cima do blob novo)
+      var esc = null, alvo = null, patch = null;
+      var rs = await _alterarBlobMain(function (data) {
+        var appts = data.appts || [];
+        esc = _escolherConsulta(appts, { idSet: idSet, nomesPorId: pac.nomes, novoStatus: novoStatus, ref: ref, hoje: _spDateStr(0), amanha: _spDateStr(1) });
+        alvo = esc.alvo;
+        if (!alvo) return null;
+        patch = montarPatchStatus(novoStatus);
+        var novoAppts = appts.map(function (a) {
+          if (a.id !== alvo.id) return a;
+          return Object.assign({}, a, patch);
+        });
+        return { novoData: _bumpVers(Object.assign({}, data, { appts: novoAppts }), ['appts']) }; // carimba: app baixa a mudanca no proximo poll
       });
-      var novoData = _bumpVers(Object.assign({}, data, { appts: novoAppts }), ['appts']); // carimba: app baixa a mudanca no proximo poll
-      var rs = await _gravarBlobMain(novoData);
+      if (!esc) return { ok: false, motivo: 'sem dados' };
+      if (!alvo) { console.log('[confirmacao] consulta nao encontrada para', telefone, 'ids:', JSON.stringify(pac.ids), 'candidatas:', esc.total); return { ok: false, motivo: 'consulta nao encontrada', nome: pac.nome }; }
       var nomeAlvo = (pac.nomes && pac.nomes[Number(alvo.patientId)]) || pac.nome;
       if (!rs.ok) return { ok: false, motivo: 'falha ao salvar', nome: nomeAlvo };
-      console.log('[confirmacao] ' + novoStatus + ': ' + nomeAlvo + ' ' + alvo.date + ' ' + alvo.time + ' (consulta ' + alvo.id + ', via ' + esc.via + ')');
+      console.log('[confirmacao] ' + novoStatus + ': ' + nomeAlvo + ' ' + alvo.date + ' ' + alvo.time + ' (consulta ' + alvo.id + ', via ' + esc.via + ')' + (rs.conflitos ? (' [refeito ' + rs.conflitos + 'x: um aparelho gravou no meio]') : ''));
       _registrarGuarda(alvo, novoStatus, patch._ts);
       return { ok: true, nome: nomeAlvo, date: alvo.date, time: alvo.time, proc: alvo.procedure || '' };
     });
@@ -1156,14 +1213,15 @@ function _purgarWaSent(sent, t) {
 async function _gravarWa(waSentNovo, novosLogs, purgar) {
   return _naFila(async function () {
     try {
-      var atual = await _lerClinicData();
-      if (!atual) return false;
-      var waSent = Object.assign({}, atual.waSent || {}, waSentNovo || {});
-      if (purgar) waSent = _purgarWaSent(waSent, _spDateStr(0));
-      var log = (novosLogs || []).concat(atual.waAutoLog || []).slice(0, 300);
-      var novoData = _bumpVers(Object.assign({}, atual, { waSent: waSent, waAutoLog: log }), ['waSent', 'waAutoLog']); // carimba: app baixa e nao apaga as marcacoes do servidor
-      var rs = await _gravarBlobMain(novoData);
-      return rs.ok;
+      // 06/10/2026: com a trava otimista (refaz em cima do blob novo se um aparelho gravar no meio)
+      var rs = await _alterarBlobMain(function (atual) {
+        var waSent = Object.assign({}, atual.waSent || {}, waSentNovo || {});
+        if (purgar) waSent = _purgarWaSent(waSent, _spDateStr(0));
+        var log = (novosLogs || []).concat(atual.waAutoLog || []).slice(0, 300);
+        return { novoData: _bumpVers(Object.assign({}, atual, { waSent: waSent, waAutoLog: log }), ['waSent', 'waAutoLog']) }; // carimba: app baixa e nao apaga as marcacoes do servidor
+      });
+      if (!rs.ok) console.error('_gravarWa nao gravou:', rs.status);
+      return !!rs.ok;
     } catch (e) { console.error('_gravarWa erro:', e); return false; }
   });
 }
