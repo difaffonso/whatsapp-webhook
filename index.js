@@ -99,12 +99,16 @@ function _normNome(s) {
 // Extrai dia (AAAA-MM-DD) e horario (HH:MM) do texto salvo do lembrete.
 function _refDoTexto(body) {
   var s = String(body || '');
-  var out = { date: null, time: null };
+  var out = { date: null, time: null, times: [], vespera: /lembrete de v[eé]spera/i.test(s) };
   var d = s.match(/(\d{2})\/(\d{2})\/(\d{4})/);
   if (!d) return out;
   out.date = d[3] + '-' + d[2] + '-' + d[1];
-  var h = s.slice(d.index + d[0].length).match(/(^|[^\d])(\d{1,2}):(\d{2})(?!\d)/); // horario DEPOIS da data
+  var resto = s.slice(d.index + d[0].length);
+  var h = resto.match(/(^|[^\d])(\d{1,2}):(\d{2})(?!\d)/); // horario DEPOIS da data
   if (h) out.time = _hhmm(h[2] + ':' + h[3]);
+  // 08/10/2026: o lembrete de vespera AGRUPADO lista todos os horarios do paciente no dia ("09:45 e 10:30")
+  var re = /(^|[^\d])(\d{1,2}):(\d{2})(?!\d)/g, mm;
+  while ((mm = re.exec(resto)) !== null) { var hh = _hhmm(mm[2] + ':' + mm[3]); if (hh && out.times.indexOf(hh) < 0) out.times.push(hh); }
   return out;
 }
 // Le o lembrete que o paciente respondeu (pelo wamid do context do botao).
@@ -135,6 +139,18 @@ function _idsDoLembrete(ref, idSet, nomesPorId) {
   var nr = _normNome(ref.nome);
   if (nr && nomesPorId) Object.keys(nomesPorId).forEach(function (id) { if (_normNome(nomesPorId[id]) === nr) out[Number(id)] = true; });
   return out;
+}
+// 08/10/2026: o lembrete de vespera AGRUPADO vale para TODAS as consultas do paciente que ele lista
+// (mesmo dia, horarios da mensagem). So da mesma pessoa -- nunca a consulta de um familiar do mesmo celular.
+function _alvosDoLembrete(appts, alvo, ref, refIds, temRefIds) {
+  if (!alvo || !ref || !ref.date || alvo.date !== ref.date) return [alvo];
+  var horas = (ref.times && ref.times.length) ? ref.times : (ref.time ? [ref.time] : []);
+  if (!horas.length) return [alvo];
+  var mesmoPac = function (a) { return temRefIds ? !!refIds[Number(a.patientId)] : Number(a.patientId) === Number(alvo.patientId); };
+  var outras = (appts || []).filter(function (a) {
+    return a && a.id !== alvo.id && a.date === ref.date && (a.status === 'pending' || a.status === 'confirmed') && horas.indexOf(_hhmm(a.time)) >= 0 && mesmoPac(a);
+  });
+  return [alvo].concat(outras).sort(function (a, b) { return _hhmm(a.time).localeCompare(_hhmm(b.time)); });
 }
 // Escolhe a consulta. o = { idSet, nomesPorId, novoStatus, ref, hoje, amanha }
 function _escolherConsulta(appts, o) {
@@ -491,17 +507,24 @@ async function atualizarStatusConsulta(telefone, novoStatus, contextId) {
     if (contextId) console.log('[confirmacao] ' + telefone + ' respondeu o lembrete ' + (ref ? (ref.date + ' ' + ref.time + ' ' + ref.nome) : '(nao achado em wa_messages)'));
 
     // 3) ler o blob, escolher a consulta e gravar -- na fila, uma resposta de cada vez
+    var refIds = _idsDoLembrete(ref, idSet, pac.nomes), temRefIds = Object.keys(refIds).length > 0;
     var res = await _naFila(async function () {
       // 06/10/2026: le + altera + grava com a trava otimista (se um aparelho gravar no meio, refaz em cima do blob novo)
-      var esc = null, alvo = null, patch = null;
+      var esc = null, alvo = null, patch = null, alvos = [], itens = [];
       var rs = await _alterarBlobMain(function (data) {
         var appts = data.appts || [];
         esc = _escolherConsulta(appts, { idSet: idSet, nomesPorId: pac.nomes, novoStatus: novoStatus, ref: ref, hoje: _spDateStr(0), amanha: _spDateStr(1) });
         alvo = esc.alvo;
         if (!alvo) return null;
+        // 08/10/2026: lembrete de vespera agrupado -> todas as consultas que ele lista; nos demais casos, so a escolhida (como antes)
+        alvos = (esc.via === 'lembrete' && ref && ref.vespera) ? _alvosDoLembrete(appts, alvo, ref, refIds, temRefIds) : [alvo];
+        var ids = {};
+        alvos.forEach(function (a) { ids[String(a.id)] = true; });
+        var dents = data.dents || [];
+        itens = alvos.map(function (a) { var d = dents.find(function (x) { return x.id === Number(a.dentistId); }); return { time: a.time, dent: d ? String(d.name || '').trim() : '' }; });
         patch = montarPatchStatus(novoStatus);
         var novoAppts = appts.map(function (a) {
-          if (a.id !== alvo.id) return a;
+          if (!a || !ids[String(a.id)]) return a;
           return Object.assign({}, a, patch);
         });
         return { novoData: _bumpVers(Object.assign({}, data, { appts: novoAppts }), ['appts']) }; // carimba: app baixa a mudanca no proximo poll
@@ -510,9 +533,9 @@ async function atualizarStatusConsulta(telefone, novoStatus, contextId) {
       if (!alvo) { console.log('[confirmacao] consulta nao encontrada para', telefone, 'ids:', JSON.stringify(pac.ids), 'candidatas:', esc.total); return { ok: false, motivo: 'consulta nao encontrada', nome: pac.nome }; }
       var nomeAlvo = (pac.nomes && pac.nomes[Number(alvo.patientId)]) || pac.nome;
       if (!rs.ok) return { ok: false, motivo: 'falha ao salvar', nome: nomeAlvo };
-      console.log('[confirmacao] ' + novoStatus + ': ' + nomeAlvo + ' ' + alvo.date + ' ' + alvo.time + ' (consulta ' + alvo.id + ', via ' + esc.via + ')' + (rs.conflitos ? (' [refeito ' + rs.conflitos + 'x: um aparelho gravou no meio]') : ''));
-      _registrarGuarda(alvo, novoStatus, patch._ts);
-      return { ok: true, nome: nomeAlvo, date: alvo.date, time: alvo.time, proc: alvo.procedure || '' };
+      console.log('[confirmacao] ' + novoStatus + ': ' + nomeAlvo + ' ' + alvo.date + ' ' + alvos.map(function (a) { return a.time; }).join(' + ') + ' (consulta ' + alvos.map(function (a) { return a.id; }).join(', ') + ', via ' + esc.via + ')' + (rs.conflitos ? (' [refeito ' + rs.conflitos + 'x: um aparelho gravou no meio]') : ''));
+      alvos.forEach(function (a) { _registrarGuarda(a, novoStatus, patch._ts); });
+      return { ok: true, nome: nomeAlvo, date: alvos[0].date, time: alvos[0].time, proc: alvo.procedure || '', itens: itens };
     });
     if (res && res.ok) {
       if (_guardaCarregada || await _carregarGuarda()) await _salvarGuarda(); // so grava o registro inteiro depois de te-lo lido
@@ -542,22 +565,27 @@ async function processarRespostaConfirmacao(from, textoResp, nomePerfil, context
     return false;
   }
   const nomeFb = (res && res.nome) || nomePerfil || 'Paciente';
+  // 08/10/2026: lembrete agrupado -> a resposta lista os horarios em ordem (reforca o PRIMEIRO)
+  const varias = !!(res && res.ok && res.itens && res.itens.length > 1);
+  const listaPac = varias ? res.itens.map(function (i) { return '\u2022 *' + i.time + '*' + (i.dent ? ' com ' + i.dent : ''); }).join('\n') : '';
+  const horasTxt = varias ? res.itens.map(function (i) { return i.time + (i.dent ? ' (' + i.dent + ')' : ''); }).join(' e ') : '';
   if (isSim) {
-    await enviarMensagem(from, '\u2705 *Presença confirmada!*\n\nObrigado! Esperamos você. \ud83d\ude0a\n\n_Affonso Odontologia_ \ud83e\uddb7');
+    if (varias) await enviarMensagem(from, '\u2705 *Presença confirmada!*\n\n\ud83d\udcc5 ' + _fmtBR(res.date) + '\n' + listaPac + '\n\nObrigado! Esperamos você. \ud83d\ude0a\n\n_Affonso Odontologia_ \ud83e\uddb7');
+    else await enviarMensagem(from, '\u2705 *Presença confirmada!*\n\nObrigado! Esperamos você. \ud83d\ude0a\n\n_Affonso Odontologia_ \ud83e\uddb7');
     let avisoSim = '\u2705 *PACIENTE CONFIRMOU*\n\n\ud83d\udc64 ' + nomeFb + '\n\ud83d\udcf1 ' + from;
     if (res && res.ok) {
-      avisoSim += '\n\ud83d\udcc5 ' + res.date + ' as ' + res.time + (res.proc ? ' \u2014 ' + res.proc : '');
+      avisoSim += '\n\ud83d\udcc5 ' + res.date + ' as ' + (varias ? horasTxt : res.time) + (res.proc ? ' \u2014 ' + res.proc : '');
       avisoSim += '\n\n\u2714\ufe0f *Status atualizado para CONFIRMADO no sistema.*';
     } else {
       avisoSim += '\n\nRespondeu *SIM* ao lembrete.\n\u26a0\ufe0f Nao consegui atualizar o sistema automaticamente (' + ((res && res.motivo) || 'verifique') + '). Confirme manualmente.';
     }
     await enviarMensagem(WHATSAPP_SECRETARIA, avisoSim);
   } else {
-    await enviarMensagem(from, 'Tudo bem! \ud83d\ude0a\n\nNossa equipe entrará em contato para *remarcar* seu horário.\n\nSe preferir, ligue: \ud83d\udcde 11 2524-9975\n\n_Affonso Odontologia_ \ud83e\uddb7');
+    await enviarMensagem(from, 'Tudo bem! \ud83d\ude0a\n\nNossa equipe entrará em contato para *remarcar* ' + (varias ? 'seus horários' : 'seu horário') + '.\n\nSe preferir, ligue: \ud83d\udcde 11 2524-9975\n\n_Affonso Odontologia_ \ud83e\uddb7');
     let avisoNao = '\u274c *PACIENTE DESMARCOU (pelo WhatsApp)*\n\n\ud83d\udc64 ' + nomeFb + '\n\ud83d\udcf1 ' + from;
     if (res && res.ok) {
-      avisoNao += '\n\ud83d\udcc5 ' + res.date + ' as ' + res.time + (res.proc ? ' \u2014 ' + res.proc : '');
-      avisoNao += '\n\n\u2714\ufe0f *Desmarcado automaticamente na agenda.*\n\ud83d\udd04 Ja aparece na aba REMARCAR. Ligar para remarcar!';
+      avisoNao += '\n\ud83d\udcc5 ' + res.date + ' as ' + (varias ? horasTxt : res.time) + (res.proc ? ' \u2014 ' + res.proc : '');
+      avisoNao += '\n\n\u2714\ufe0f *' + (varias ? ('As ' + res.itens.length + ' consultas foram desmarcadas') : 'Desmarcado') + ' automaticamente na agenda.*\n\ud83d\udd04 Ja aparece na aba REMARCAR. Ligar para remarcar!';
     } else {
       avisoNao += '\n\nRespondeu *NAO* ao lembrete.\n\u26a0\ufe0f Nao consegui atualizar o sistema (' + ((res && res.motivo) || 'verifique') + '). Desmarque manualmente e ligue para remarcar!';
     }
@@ -568,6 +596,27 @@ async function processarRespostaConfirmacao(from, textoResp, nomePerfil, context
 
 // Anti-spam em memória
 const ultimoEnvio = {};
+
+// 08/10/2026: texto curto com cara de resposta ao lembrete (sem pergunta)
+function _pareceRespostaAoLembrete(texto) {
+  var n = String(texto || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ').trim();
+  if (!n || n.length > 80 || n.indexOf('?') >= 0) return false;
+  return /(^|[^a-z])(sim|confirm[a-z]*|ok|okay|certo|combinado|estarei|irei|vou sim|desmarc[a-z]*|cancel[a-z]*|remarc[a-z]*|nao vou|nao poderei|nao posso|nao consigo)([^a-z]|$)/.test(n);
+}
+// 08/10/2026: este celular recebeu lembrete (vespera ou confirmacao) nas ultimas 48h?
+async function _lembreteRecente(telefone) {
+  try {
+    var f8 = soDigitos(telefone).slice(-8);
+    if (f8.length < 8) return false;
+    var desde = new Date(Date.now() - 48 * 3600 * 1000).toISOString();
+    var r = await fetch(SUPA_URL + "/rest/v1/wa_messages?select=id&direction=eq.out&phone=like.*" + f8 + "&body=like.*Lembrete*&created_at=gte." + encodeURIComponent(desde) + "&limit=1", {
+      headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY }
+    });
+    if (!r.ok) return false;
+    var rows = await r.json();
+    return Array.isArray(rows) && rows.length > 0;
+  } catch (e) { return false; }
+}
 
 function dentroDoHorario() {
   const agora = new Date();
@@ -908,6 +957,12 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
           if (agora - ultimoTempo < 3 * 60 * 1000) return res.status(200).json({ status: 'ok' });
           ultimoEnvio[from] = agora;
         }
+        // 08/10/2026: quem ESCREVE "pode confirmar" logo depois do lembrete recebia o menu e achava que tinha
+        // confirmado (caso real 06/10). A agenda continua sem mudar (regra de 24/09); agora orienta a tocar no botao.
+        if (!opcaoMenu && _pareceRespostaAoLembrete(texto) && await _lembreteRecente(from)) {
+          await enviarMensagem(from, 'Para *confirmar* ou *desmarcar*, é só tocar no botão *Confirmar* ou *Desmarcar* na mensagem do lembrete acima. \ud83d\ude0a\n\nAssim sua resposta entra na agenda na hora.\n\n_Affonso Odontologia_ \ud83e\uddb7');
+          return res.status(200).json({ status: 'ok' });
+        }
         if (!dentroDoHorario()) {
           await enviarMensagem(from,
             `Olá! 😊 Obrigado por entrar em contato com a *Affonso Odontologia* 🦷\n\nNo momento estamos fora do horário de atendimento.\n\n${horarioAtendimento()}\n\nAssim que retornarmos, entraremos em contato. Ou se preferir:\n\n👉 ${linkWhatsApp("Olá! Entrei em contato fora do horário pela Affonso Odontologia.")}`
@@ -1040,6 +1095,39 @@ async function _carregarPacientes() {
   return { lista: lista, porId: porId };
 }
 
+// ============================================================
+// VESPERA AGRUPADA (08/10/2026): paciente com mais de uma consulta no mesmo
+// dia recebia UMA MENSAGEM POR CONSULTA (caso real 06/10: 09:45 com a Dra.
+// Simone e 10:30 com a Dra. Juliana, mais o lembrete de um familiar no mesmo
+// celular -- o paciente guardou so o 2o horario e perdeu o 1o). Agora vai UMA
+// mensagem por paciente e por dia, com os horarios em ordem ("09:45 e 10:30")
+// e os dentistas na mesma ordem. Confirmar/Desmarcar vale para todas as
+// consultas listadas (_alvosDoLembrete). Paciente com UMA consulta: mensagem
+// identica a de antes.
+// ============================================================
+function _juntarLista(itens) {
+  var u = [];
+  (itens || []).forEach(function (x) { x = String(x == null ? '' : x).trim(); if (x && u.indexOf(x) < 0) u.push(x); });
+  if (u.length <= 1) return u[0] || '';
+  return u.slice(0, -1).join(', ') + ' e ' + u[u.length - 1];
+}
+function _paramsVespera(p, lista, dOf) {
+  var ord = lista.slice().sort(function (a, b) { return _hhmm(a.time).localeCompare(_hhmm(b.time)); });
+  if (ord.length === 1) { var a0 = ord[0]; return [p.name, _fmtBR(a0.date), a0.time, dOf(a0.dentistId).name]; }
+  return [p.name, _fmtBR(ord[0].date), _juntarLista(ord.map(function (a) { return _hhmm(a.time) || a.time; })), _juntarLista(ord.map(function (a) { return dOf(a.dentistId).name; }))];
+}
+// Agrupa consultas por paciente (mesmo cadastro) e dia; mantem a ordem em que aparecem
+function _gruposVespera(lista, porId) {
+  var grupos = {}, ordem = [];
+  (lista || []).forEach(function (a) {
+    var p = porId[Number(a.patientId)]; if (!p || !p.phone) return;
+    var k = String(p.id != null ? p.id : a.patientId) + '|' + a.date;
+    if (!grupos[k]) { grupos[k] = { k: k, p: p, lista: [] }; ordem.push(k); }
+    grupos[k].lista.push(a);
+  });
+  return ordem.map(function (k) { return grupos[k]; });
+}
+
 // Monta a fila de envios (mesmas regras do app). Não envia — só decide quem recebe o quê.
 function _montarFila(data, pacientes, t, tm, y) {
   var cfg = data.waAuto || {};
@@ -1066,12 +1154,13 @@ function _montarFila(data, pacientes, t, tm, y) {
 
   // 1) VÉSPERA — consultas de amanhã, Pendente/Confirmada
   if (cfg.vespera) {
-    appts.forEach(function (a) {
-      if (a.date !== tm || a.blocked) return;
-      if (a.status !== 'pending' && a.status !== 'confirmed') return;
-      var p = pacientes.porId[Number(a.patientId)]; if (!p || !p.phone) return;
-      var d = dOf(a.dentistId);
-      addJob("Véspera", "v_" + a.id + "_" + a.date, "lembrete_vespera", p.phone, [p.name, _fmtBR(a.date), a.time, d.name], p.name);
+    var elegV = appts.filter(function (a) { return a.date === tm && !a.blocked && (a.status === 'pending' || a.status === 'confirmed'); });
+    _gruposVespera(elegV, pacientes.porId).forEach(function (G) { // 08/10/2026: uma mensagem por paciente e por dia
+      var pend = G.lista.filter(function (a) { return !sent['v_' + a.id + '_' + a.date]; });
+      if (!pend.length) return;
+      var antes = fila.length;
+      addJob("Véspera", "v_" + pend[0].id + "_" + pend[0].date, "lembrete_vespera", G.p.phone, _paramsVespera(G.p, G.lista, dOf), G.p.name);
+      if (fila.length > antes && pend.length > 1) fila[fila.length - 1].extraKeys = pend.slice(1).map(function (a) { return "v_" + a.id + "_" + a.date; });
     });
   }
 
@@ -1368,25 +1457,27 @@ async function rodarVespera() {
     (d0.waAutoLog || []).forEach(function (l) { if ((l.ts || '').slice(0, 10) === t && l.tipo === 'Véspera') jaHoje++; });
 
     // consultas de amanhã, elegíveis e que AINDA não receberam o lembrete
-    var alvos = appts.filter(function (a) {
-      return a.date === tm && !a.blocked && (a.status === 'pending' || a.status === 'confirmed') && !sent['v_' + a.id + '_' + a.date];
+    var elegiveis = appts.filter(function (a) {
+      return a.date === tm && !a.blocked && (a.status === 'pending' || a.status === 'confirmed');
     });
+    var alvos = elegiveis.filter(function (a) { return !sent['v_' + a.id + '_' + a.date]; });
     if (!alvos.length) return;
 
     if (!_patCache.ts) await _atualizarCachePacientes();
     var porId = _patCache.porId || {};
 
+    // 08/10/2026: uma mensagem por paciente e por dia, listando TODAS as consultas dele no dia
+    // (paciente novo fora do cache fica de fora, como antes: já recebeu a Confirmação ao agendar)
+    var gruposNovos = _gruposVespera(alvos, porId), todosPorK = {};
+    _gruposVespera(elegiveis, porId).forEach(function (G) { todosPorK[G.k] = G; });
     var enviados = 0, waSentNovo = {}, novosLogs = [];
-    for (var i = 0; i < alvos.length; i++) {
+    for (var i = 0; i < gruposNovos.length; i++) {
       if (jaHoje + enviados >= WA_MAX_POR_TIPO) break;
-      var a = alvos[i];
-      var p = porId[Number(a.patientId)];
-      if (!p || !p.phone) continue; // paciente novo fora do cache: já recebeu a Confirmação ao agendar
-      var d = dOf(a.dentistId);
+      var Gn = gruposNovos[i], p = Gn.p, Gt = todosPorK[Gn.k] || Gn;
       var fone = _normFone(p.phone);
-      var rr = await enviarTemplate(fone, 'lembrete_vespera', [p.name, _fmtBR(a.date), a.time, d.name]);
+      var rr = await enviarTemplate(fone, 'lembrete_vespera', _paramsVespera(p, Gt.lista, dOf));
       var ok = !!(rr && rr.ok);
-      if (ok) { enviados++; waSentNovo['v_' + a.id + '_' + a.date] = t; }
+      if (ok) { enviados++; Gn.lista.forEach(function (a) { waSentNovo['v_' + a.id + '_' + a.date] = t; }); }
       novosLogs.push({ ts: new Date().toISOString(), tipo: 'Véspera', pat: p.name, fone: fone, ok: ok, err: (rr && rr.error) || '' });
       console.log('[auto/vespera] ' + (ok ? 'OK' : 'ERRO') + ' ' + p.name + ' ' + fone + (ok ? '' : (' :: ' + ((rr && rr.error) || '?'))));
       await new Promise(function (res) { setTimeout(res, 1300); });
