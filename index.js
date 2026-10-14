@@ -603,18 +603,31 @@ function _pareceRespostaAoLembrete(texto) {
   if (!n || n.length > 80 || n.indexOf('?') >= 0) return false;
   return /(^|[^a-z])(sim|confirm[a-z]*|ok|okay|certo|combinado|estarei|irei|vou sim|desmarc[a-z]*|cancel[a-z]*|remarc[a-z]*|nao vou|nao poderei|nao posso|nao consigo)([^a-z]|$)/.test(n);
 }
-// 08/10/2026: este celular recebeu lembrete (vespera ou confirmacao) nas ultimas 48h?
-async function _lembreteRecente(telefone) {
+// 14/10/2026: a orientacao "toque no botao" so vale depois do LEMBRETE DE VESPERA (a mensagem que tem os
+// botoes) e so se o paciente ainda nao tocou em nenhum botao. Antes valia para qualquer "Lembrete" e saiu para
+// quem so escreveu "Ok" na mensagem de quando a consulta e marcada (sem botao) -- 3 casos em 09/10.
+const _botaoTocado = {};             // ultimos 8 digitos do telefone -> quando tocou num botao (memoria)
+const _inicioServidor = Date.now();  // depois de reiniciar, a memoria esta vazia: confere as respostas salvas
+async function _vesperaSemResposta(telefone) {
   try {
     var f8 = soDigitos(telefone).slice(-8);
     if (f8.length < 8) return false;
-    var desde = new Date(Date.now() - 48 * 3600 * 1000).toISOString();
-    var r = await fetch(SUPA_URL + "/rest/v1/wa_messages?select=id&direction=eq.out&phone=like.*" + f8 + "&body=like.*Lembrete*&created_at=gte." + encodeURIComponent(desde) + "&limit=1", {
-      headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY }
-    });
+    var h = { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY };
+    var desde = new Date(Date.now() - 36 * 3600 * 1000).toISOString();
+    var r = await fetch(SUPA_URL + "/rest/v1/wa_messages?select=created_at&direction=eq.out&phone=like.*" + f8 + "&body=like." + encodeURIComponent("*Lembrete de vespera*") + "&created_at=gte." + encodeURIComponent(desde) + "&order=created_at.desc&limit=1", { headers: h });
     if (!r.ok) return false;
     var rows = await r.json();
-    return Array.isArray(rows) && rows.length > 0;
+    if (!Array.isArray(rows) || !rows.length) return false;          // sem lembrete de vespera recente: nada a orientar
+    var tVesp = Date.parse(rows[0].created_at);
+    if (!tVesp) return false;
+    if ((_botaoTocado[f8] || 0) > tVesp) return false;                 // ja tocou num botao depois do lembrete
+    if (tVesp < _inicioServidor) {                                     // o servidor reiniciou depois do lembrete
+      var r2 = await fetch(SUPA_URL + "/rest/v1/wa_messages?select=id&direction=eq.in&phone=like.*" + f8 + "&body=in.(Confirmar,Desmarcar)&created_at=gt." + encodeURIComponent(rows[0].created_at) + "&limit=1", { headers: h });
+      if (!r2.ok) return false;
+      var rows2 = await r2.json();
+      if (Array.isArray(rows2) && rows2.length) return false;
+    }
+    return true;
   } catch (e) { return false; }
 }
 
@@ -910,6 +923,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
           const ctxBtn = (msg.context && msg.context.id) || null; // 02/10/2026: wamid do lembrete em que o botao foi tocado
           const msgTimestampBtn = parseInt(msg.timestamp) * 1000;
           if (Date.now() - msgTimestampBtn > 120000) return res.status(200).json({ status: 'ok' });
+          _botaoTocado[soDigitos(from).slice(-8)] = Date.now(); // 14/10/2026: tocou num botao -> nao recebe a orientacao depois
           const nomePerfilBtn = value?.contacts?.[0]?.profile?.name || '';
           console.log('[botao] ' + from + ' tocou "' + textoBtn + '" no lembrete ' + (ctxBtn || '(sem context)'));
           const tratadoBtn = await processarRespostaConfirmacao(from, textoBtn, nomePerfilBtn, ctxBtn);
@@ -959,7 +973,7 @@ app.post('/api/webhook/whatsapp', async (req, res) => {
         }
         // 08/10/2026: quem ESCREVE "pode confirmar" logo depois do lembrete recebia o menu e achava que tinha
         // confirmado (caso real 06/10). A agenda continua sem mudar (regra de 24/09); agora orienta a tocar no botao.
-        if (!opcaoMenu && _pareceRespostaAoLembrete(texto) && await _lembreteRecente(from)) {
+        if (!opcaoMenu && _pareceRespostaAoLembrete(texto) && await _vesperaSemResposta(from)) {
           await enviarMensagem(from, 'Para *confirmar* ou *desmarcar*, é só tocar no botão *Confirmar* ou *Desmarcar* na mensagem do lembrete acima. \ud83d\ude0a\n\nAssim sua resposta entra na agenda na hora.\n\n_Affonso Odontologia_ \ud83e\uddb7');
           return res.status(200).json({ status: 'ok' });
         }
